@@ -5,6 +5,7 @@
 // allocate, and its presence is what switches on the simulation path.
 //
 //!nbody 131072
+//!alias gravity grav nbody stars
 //
 // 131072 bodies is 1.7e10 interactions per step, ~21 fps on an RTX 2080 SUPER.
 // --particles 65536 quarters the work and roughly quadruples the frame rate.

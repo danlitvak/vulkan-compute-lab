@@ -1,5 +1,7 @@
 #version 450
 
+//!alias noise fbm clouds
+
 // A second shader, mostly to prove the swap path works:
 //   lab.exe shaders/warp.comp
 // Domain-warped value noise — cheap per pixel, so it also serves as a rough

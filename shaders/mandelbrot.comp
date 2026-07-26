@@ -1,5 +1,7 @@
 #version 450
 
+//!alias fractal mandel set
+
 // One invocation per pixel. 16x16 = 256 threads per workgroup, which maps
 // cleanly onto both AMD wave64 and NVIDIA warp32 scheduling.
 layout(local_size_x = 16, local_size_y = 16) in;

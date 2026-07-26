@@ -18,26 +18,36 @@ is the same shader as the first, zoomed 400x.*
 ## Run it
 
 ```powershell
-.\build.ps1 -Run
+.\run grav
 ```
 
-`build.ps1` locates VS Build Tools, imports the MSVC environment, and builds with
-the CMake and Ninja that ship inside it — nothing needs to be on `PATH`.
+That builds and launches, matching `grav` to `galaxy.comp`. Names resolve against
+each shader's filename and any `//!alias` line in its header, trying exact, then
+prefix, then substring, then subsequence — so `mandel`, `mbrot` and `fractal` all
+find `mandelbrot.comp`. An ambiguous name lists the candidates rather than
+guessing.
 
 ```powershell
-.\build.ps1 -Run -Shader shaders\warp.comp    # a different shader
-.\build.ps1 -Config Release -Run              # no validation layers
+.\run                            # list what is available
+.\run grav -Release              # optimised, no validation layers
+.\run grav -Clean                # wipe the build directory first
+.\run grav --particles 65536     # unrecognised flags go straight to lab.exe
 ```
 
-Once it is built, launch the exe directly — faster, and it takes the flags below:
+Nothing needs to be on `PATH`: the build locates VS Build Tools, imports the MSVC
+environment, and uses the CMake and Ninja that ship inside it. A clean rebuild
+takes about 17s and an incremental one about 6s, so `.\run` is cheap to spam.
+
+You do **not** rebuild to change a shader. Leave the window open, edit the
+`.comp` file, save, and it swaps the pipeline within a frame or two. The build
+step only matters for C++ changes.
+
+`build.ps1` is still there if you want to build without running, and the exe
+takes a path directly:
 
 ```powershell
 .\build\Debug\lab.exe shaders\warp.comp
 ```
-
-You do not rebuild to change a shader. Leave the window open, edit the `.comp`
-file, save, and it swaps the pipeline within a frame or two. `build.ps1` is only
-for C++ changes.
 
 | | |
 |---|---|
@@ -160,8 +170,8 @@ path: instead of one dispatch per frame it becomes a four-pass simulation with
 particle storage buffers behind it.
 
 ```powershell
-.\build\Debug\lab.exe shaders\galaxy.comp
-.\build\Debug\lab.exe shaders\galaxy.comp --particles 65536   # 4x faster
+.\run grav
+.\run grav --particles 65536   # 4x faster
 ```
 
 `galaxy.comp` is an N-body disk galaxy: an exponential stellar disk orbiting
@@ -232,7 +242,14 @@ and fade, exactly as they do in pure N-body disk models.
 
 ## Writing a shader
 
-Copy `shaders/mandelbrot.comp` and change the body. The contract is three things:
+Copy `shaders/mandelbrot.comp` and change the body — `.\run` picks up new files
+automatically. Give it short names to type with an alias line in the header:
+
+```glsl
+//!alias fractal mandel set
+```
+
+The contract is three things:
 
 ```glsl
 layout(local_size_x = 16, local_size_y = 16) in;      // 256 threads per workgroup

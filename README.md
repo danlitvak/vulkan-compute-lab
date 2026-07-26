@@ -9,6 +9,7 @@ No render pass, no framebuffers, no vertex or fragment stages.
 
 ![mandelbrot](docs/mandelbrot.png)
 ![the same shader zoomed 400x](docs/deepzoom.png)
+![N-body galaxy of 131072 bodies](docs/galaxy.png)
 ![domain-warped noise](docs/warp.png)
 
 *Every frame here was captured by the app itself with `--capture`. The middle one
@@ -152,6 +153,83 @@ Going genuinely deeper is a precision problem, not a limit that can be tuned
 away: it needs fp64 coordinates (good to ~1e13, and roughly 1/32 rate on
 consumer NVIDIA) or perturbation theory against a high-precision reference orbit.
 
+## Simulations
+
+A shader whose header carries a `//!nbody <count>` directive runs a different
+path: instead of one dispatch per frame it becomes a four-pass simulation with
+particle storage buffers behind it.
+
+```powershell
+.\build\Debug\lab.exe shaders\galaxy.comp
+.\build\Debug\lab.exe shaders\galaxy.comp --particles 65536   # 4x faster
+```
+
+`galaxy.comp` is an N-body disk galaxy: an exponential stellar disk orbiting
+inside a static dark-matter halo, integrated with exact all-pairs gravity.
+
+| | |
+|---|---|
+| `Space` | reseed |
+| `P` | pause the physics (the camera still works) |
+
+All four passes live in one file behind `#ifdef` guards and are compiled from it
+once each with `-D`, so the whole effect still reloads as a unit when you save:
+
+```
+SEED       one invocation per particle, writes initial conditions
+INTEGRATE  one per particle, all-pairs force sum with shared-memory tiling
+RENDER     one per particle, atomic splat into a count image
+TONEMAP    one per pixel, counts -> colour, and zeroes the counts again
+```
+
+Seeding is a dispatch rather than a host upload, which means the initial
+conditions are shader code too — nothing about the simulation is baked into C++
+except the particle count, which only decides how big the buffers are. Editing
+gravity or dispersion reloads the pipelines and **keeps the particles**, so the
+disk changes behaviour in place without restarting.
+
+### How large is "large"
+
+All-pairs is O(N²) and exact — no tree, no approximation. Measured here on an
+RTX 2080 SUPER at 1280x720:
+
+| Bodies | Interactions / step | Frame rate |
+|---|---|---|
+| 32,768 | 1.1e9 | ~150 fps |
+| 65,536 | 4.3e9 | ~79 fps |
+| 131,072 | 1.7e10 | ~21 fps |
+
+So this is a *tracer* galaxy: enough particles to resolve disk dynamics and
+structure, not a star-for-star model of the 10⁸–10¹¹ a real galaxy has. Every
+doubling costs 4x. Getting to millions needs Barnes-Hut or a particle-mesh
+solver, which is a different project.
+
+### The physics, and the two things that break it
+
+Both of these produced obviously wrong pictures before they were fixed, and both
+are the kind of error that looks like a rendering bug:
+
+- **Seed velocities must match the *softened* force.** Inside the softening
+  radius the real force is Plummer-softened and far weaker than `1/r²`. Seeding
+  from ideal `√(GM/r)` gave core particles several times the speed they needed —
+  the centre flung itself outward and left a hole with a bright ring around it.
+  `circularSpeedSquared()` derives the curve from the force the integrator
+  actually applies, and both terms go to zero at r→0 as a softened core should.
+- **Toomre Q decides whether it is a galaxy or a clump swarm.**
+  `Q = σ_R·κ / (3.36·G·Σ)`. Below 1 a disk fragments into bound clumps; well
+  above it goes featureless. The first working version sat at Q ≈ 0.26 and
+  promptly broke into half a dozen mini-galaxies.
+
+The shipped constants sit safely above the threshold. **Crossing it is the
+experiment worth running:** drop `DISPERSION` toward 0.30 or raise `DISK_MASS`
+toward 1.0, save, and watch the disk destabilise in place over a few hundred
+steps.
+
+The disk is razor-thin 2D, so softening also stands in for the vertical
+thickness that would otherwise help stabilise it. There is no gas and therefore
+no dissipation, which is why spiral arms here are transient — they heat the disk
+and fade, exactly as they do in pure N-body disk models.
+
 ## Writing a shader
 
 Copy `shaders/mandelbrot.comp` and change the body. The contract is three things:
@@ -242,9 +320,11 @@ src/
   app.cpp              storage images, descriptors, pipeline, frame loop,
                        navigation, capture
   png.cpp              dependency-free PNG writer for screenshots
+  simulation.cpp       particle buffers, four-pass N-body path, accumulation images
 shaders/
   mandelbrot.comp      smooth-iteration Mandelbrot, iteration count scaled by zoom
   warp.comp            domain-warped value noise
+  galaxy.comp          N-body disk galaxy in a dark-matter halo (four passes)
 docs/                  README captures, produced with --capture
 ```
 
@@ -264,8 +344,10 @@ to stderr. Development happens with them on.
 
 ## Next
 
-- [ ] Storage buffers: an N-body particle system, dispatch over particles rather than pixels
+- [x] Storage buffers: an N-body particle system, dispatch over particles rather than pixels
+- [x] Shared-memory tiling, to show `local_size` and cache behaviour mattering
+- [ ] Barnes-Hut or particle-mesh, to get past the O(N²) ceiling into the millions
+- [ ] A colliding pair of galaxies — two seeded disks on a hyperbolic encounter
 - [ ] Ping-pong images for stateful simulation (reaction-diffusion, fluid)
 - [ ] A raymarched SDF scene with soft shadows
 - [ ] Timestamp queries, to report actual GPU dispatch time instead of frame rate
-- [ ] Shared-memory tiling, to show `local_size` and cache behaviour mattering

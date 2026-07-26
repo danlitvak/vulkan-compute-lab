@@ -67,7 +67,32 @@ std::vector<uint32_t> readSpirv(const fs::path& path) {
 
 } // namespace
 
-CompileResult compileComputeShader(const fs::path& source) {
+uint32_t readParticleDirective(const fs::path& source) {
+    static constexpr const char* kDirective = "//!nbody";
+    static constexpr size_t kDirectiveLength = 8;
+
+    std::ifstream file(source);
+    if (!file) return 0;
+
+    std::string line;
+    for (int scanned = 0; scanned < 40 && std::getline(file, line); ++scanned) {
+        // The directive must open the line. Matching anywhere would also hit a
+        // comment that merely mentions it, which is exactly what a shader
+        // documenting its own header does.
+        const size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        if (line.compare(start, kDirectiveLength, kDirective) != 0) continue;
+
+        const char* argument = line.c_str() + start + kDirectiveLength;
+        char* end = nullptr;
+        const unsigned long count = std::strtoul(argument, &end, 10);
+        if (end == argument || count == 0) continue; // no number: keep looking
+        return static_cast<uint32_t>(count);
+    }
+    return 0;
+}
+
+CompileResult compileComputeShader(const fs::path& source, const std::vector<std::string>& defines) {
     CompileResult result;
 
     if (!fs::exists(source)) {
@@ -75,9 +100,14 @@ CompileResult compileComputeShader(const fs::path& source) {
         return result;
     }
 
+    // The output name has to vary with the defines, or the passes of a
+    // multi-pass effect overwrite each other's SPIR-V.
+    std::string variant;
+    for (const std::string& define : defines) variant += "_" + define;
+
     const fs::path temp = fs::temp_directory_path();
-    const fs::path spvPath = temp / "vulkan_compute_lab.spv";
-    const fs::path logPath = temp / "vulkan_compute_lab.log";
+    const fs::path spvPath = temp / ("vulkan_compute_lab" + variant + ".spv");
+    const fs::path logPath = temp / ("vulkan_compute_lab" + variant + ".log");
 
     std::error_code ec;
     fs::remove(spvPath, ec);
@@ -90,8 +120,9 @@ CompileResult compileComputeShader(const fs::path& source) {
 
     std::ostringstream command;
     command << '"' << glslcPath().string() << '"'
-            << " -O --target-env=vulkan1.3 -fshader-stage=compute"
-            << " \"" << input.string() << "\""
+            << " -O --target-env=vulkan1.3 -fshader-stage=compute";
+    for (const std::string& define : defines) command << " -D" << define;
+    command << " \"" << input.string() << "\""
             << " -o \"" << spvPath.string() << "\""
             << " > \"" << logPath.string() << "\" 2>&1";
 

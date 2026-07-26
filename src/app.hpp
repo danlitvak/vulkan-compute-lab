@@ -1,10 +1,12 @@
 #pragma once
 
 #include "context.hpp"
+#include "simulation.hpp"
 #include "swapchain.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 struct GLFWwindow;
@@ -43,6 +45,8 @@ struct Options {
     // Deepest zoom allowed. 0 derives it from the framebuffer height; negative
     // removes the limit and lets the view quantize.
     double maxZoom{0.0};
+    // Overrides a simulation shader's //!nbody directive. 0 keeps the directive.
+    uint32_t particleCount{0};
 };
 
 class App {
@@ -76,7 +80,9 @@ private:
     void destroyPresentSemaphores();
 
     bool reloadShader(bool initial);
+    bool reloadSimulation(uint32_t particleCount, bool initial);
     void destroyPipeline();
+    std::vector<VkImageView> targetViews() const;
 
     void mainLoop();
     bool drawFrame(); // false when the frame was skipped to rebuild the swapchain
@@ -128,6 +134,10 @@ private:
     VkPipelineLayout pipelineLayout_{};
     VkPipeline pipeline_{};
     VkDescriptorPool descriptorPool_{};
+
+    // Non-null only when the shader declares //!nbody. In that mode the
+    // single-pass pipeline above is unused and the simulation records the frame.
+    std::unique_ptr<Simulation> sim_;
 
     std::vector<Frame> frames_;
     std::vector<VkSemaphore> presentReady_; // one per swapchain image

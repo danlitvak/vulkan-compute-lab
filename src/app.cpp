@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <stdexcept>
 #include <string>
@@ -90,6 +91,10 @@ void App::onKey(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
     if (key == GLFW_KEY_R) app->reloadRequested_ = true;
     if (key == GLFW_KEY_F12) app->screenshotRequested_ = true;
+    if (app->sim_) {
+        if (key == GLFW_KEY_SPACE) app->sim_->requestSeed();
+        if (key == GLFW_KEY_P) app->sim_->setPaused(!app->sim_->paused());
+    }
     if (key == GLFW_KEY_HOME) { // ease back to the default view
         app->nav_.centerX = app->nav_.centerY = 0.0;
         app->nav_.scale = 1.0;
@@ -378,7 +383,56 @@ void App::destroyPresentSemaphores() {
 
 // ------------------------------------------------------- shader pipeline ----
 
+std::vector<VkImageView> App::targetViews() const {
+    std::vector<VkImageView> views;
+    views.reserve(frames_.size());
+    for (const Frame& frame : frames_) views.push_back(frame.targetView);
+    return views;
+}
+
+// A shader declaring //!nbody runs the multi-pass simulation path instead of the
+// single dispatch. Editing such a shader rebuilds its pipelines but keeps the
+// particle state, so you can retune gravity mid-flight without restarting.
+bool App::reloadSimulation(uint32_t particleCount, bool initial) {
+    if (sim_ && sim_->particleCount() == particleCount) {
+        return sim_->reloadPipelines(ctx_, shaderPath_);
+    }
+
+    auto rebuilt = std::make_unique<Simulation>();
+    if (!rebuilt->create(ctx_, shaderPath_, particleCount, targetViews(), swapchain_.extent())) {
+        rebuilt->destroy(ctx_);
+        if (!initial) std::fprintf(stderr, "[lab] keeping the previous simulation\n");
+        return false;
+    }
+
+    if (sim_) {
+        vkDeviceWaitIdle(ctx_.device());
+        sim_->destroy(ctx_);
+    }
+    sim_ = std::move(rebuilt);
+    std::printf("[lab] simulating %u particles (%.1f M interactions per step)\n", particleCount,
+                double(particleCount) * particleCount / 1e6);
+    return true;
+}
+
 bool App::reloadShader(bool initial) {
+    if (const uint32_t declared = readParticleDirective(shaderPath_); declared > 0) {
+        const uint32_t count = options_.particleCount > 0 ? options_.particleCount : declared;
+        if (!reloadSimulation(count, initial)) return false;
+        std::error_code simEc;
+        shaderWriteTime_ = fs::last_write_time(shaderPath_, simEc);
+        std::printf("[lab] %s %s\n", initial ? "loaded" : "reloaded",
+                    shaderPath_.filename().string().c_str());
+        return true;
+    }
+
+    // Switching from a simulation shader back to a plain one.
+    if (sim_) {
+        vkDeviceWaitIdle(ctx_.device());
+        sim_->destroy(ctx_);
+        sim_.reset();
+    }
+
     const CompileResult result = compileComputeShader(shaderPath_);
     if (!result.ok) {
         std::fprintf(stderr, "[lab] shader compile failed:\n%s\n", result.message.c_str());
@@ -506,12 +560,21 @@ bool App::drawFrame() {
                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT,
                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
-    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
-                            &frame.descriptor, 0, nullptr);
-    vkCmdPushConstants(frame.cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(frame.cmd, groupCount(extent.width, kWorkgroupSize),
-                  groupCount(extent.height, kWorkgroupSize), 1);
+    if (sim_) {
+        SimPushConstants simPush{};
+        static_assert(sizeof(simPush) >= sizeof(push), "sim push must extend the standard block");
+        std::memcpy(&simPush, &push, sizeof(push)); // identical leading layout
+        simPush.particleCount = sim_->particleCount();
+        sim_->record(frame.cmd, frameIndex_, simPush);
+    } else {
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
+                                &frame.descriptor, 0, nullptr);
+        vkCmdPushConstants(frame.cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
+        vkCmdDispatch(frame.cmd, groupCount(extent.width, kWorkgroupSize),
+                      groupCount(extent.height, kWorkgroupSize), 1);
+    }
 
     imageBarrier(frame.cmd, frame.target, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
@@ -714,6 +777,10 @@ void App::recreateSwapchain() {
     swapchain_.create(ctx_, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
     createFrameTargets();
     createPresentSemaphores();
+
+    // The simulation's accumulation images track the framebuffer, and its
+    // descriptors point at target views that were just recreated.
+    if (sim_) sim_->resize(ctx_, targetViews(), swapchain_.extent());
 }
 
 void App::updateTitle(double now) {
@@ -722,9 +789,13 @@ void App::updateTitle(double now) {
 
     const double fps = framesSinceTitleUpdate_ / (now - lastTitleUpdate_);
     const VkExtent2D extent = swapchain_.extent();
-    char title[256];
-    std::snprintf(title, sizeof(title), "vulkan-compute-lab — %s — %ux%u — %.0f fps",
-                  shaderPath_.filename().string().c_str(), extent.width, extent.height, fps);
+    char detail[96] = "";
+    if (sim_)
+        std::snprintf(detail, sizeof(detail), " — %u bodies%s", sim_->particleCount(),
+                      sim_->paused() ? " (paused)" : "");
+    char title[320];
+    std::snprintf(title, sizeof(title), "vulkan-compute-lab — %s%s — %ux%u — %.0f fps",
+                  shaderPath_.filename().string().c_str(), detail, extent.width, extent.height, fps);
     glfwSetWindowTitle(window_, title);
 
     lastTitleUpdate_ = now;
@@ -732,6 +803,10 @@ void App::updateTitle(double now) {
 }
 
 void App::cleanup() {
+    if (sim_) {
+        sim_->destroy(ctx_);
+        sim_.reset();
+    }
     destroyPipeline();
     destroyPresentSemaphores();
     destroyFrameTargets();

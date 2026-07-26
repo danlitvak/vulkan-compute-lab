@@ -30,6 +30,7 @@ add_executable(lab
   src/swapchain.cpp
   src/shader_compiler.cpp
   src/png.cpp
+  src/simulation.cpp
   src/app.cpp
 )
 

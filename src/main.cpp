@@ -27,8 +27,11 @@ void printUsage() {
         "                          from the resolution (fp32 quantizes past it)\n"
         "  --help\n"
         "\n"
+        "  --particles <n>         override a simulation shader's //!nbody count\n"
+        "\n"
         "mouse: drag to pan, scroll to zoom (about the cursor)\n"
         "keys:  R reload shader, Home reset view, Esc quit\n"
+        "       Space reseed simulation, P pause simulation\n"
         "       F12 screenshot -> screenshots/<shader>/<shader>-<timestamp>.png\n"
         "the shader also reloads on its own whenever the file changes on disk\n");
 }
@@ -64,6 +67,8 @@ int main(int argc, char** argv) {
             options.zoom = std::strtod(argv[++i], nullptr);
         } else if (arg == "--max-zoom" && hasValue) {
             options.maxZoom = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--particles" && hasValue) {
+            options.particleCount = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (!arg.empty() && arg.front() == '-') {
             std::fprintf(stderr, "[lab] unknown option: %s\n", arg.c_str());
             printUsage();

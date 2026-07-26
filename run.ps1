@@ -22,6 +22,10 @@ param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo')]
     [string]$Config = 'Debug',
 
+    # Shorthand for -Config Release. Without this the token falls through to
+    # $Rest and lab.exe rejects it as an unknown option.
+    [switch]$Release,
+
     [switch]$Clean,
     [switch]$List,
 
@@ -32,6 +36,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+if ($Release) { $Config = 'Release' }
 
 # --- catalogue ----------------------------------------------------------------
 

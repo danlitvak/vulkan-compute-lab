@@ -187,10 +187,24 @@ particle storage buffers behind it.
 `galaxy.comp` is an N-body disk galaxy: an exponential stellar disk orbiting
 inside a static dark-matter halo, integrated with exact all-pairs gravity.
 
+It is a **3D** simulation with a free-fly camera, so you can get inside the disk
+rather than looking down at it. World is z-up with the disk in the xy plane.
+
 | | |
 |---|---|
+| drag | look around |
+| `W` `A` `S` `D` | fly forward / left / back / right |
+| `Q` `E` | down / up |
+| `Shift` `Ctrl` | boost / crawl |
+| scroll | trim fly speed (shown in the title bar) |
+| `Home` | back to the starting viewpoint |
 | `Space` | reseed |
 | `P` | pause the physics (the camera still works) |
+
+Dragging is **grab-the-world**, matching the 2D pan: drag right and the scene
+moves right, which means the camera turns left. That is the opposite of FPS-style
+mouse-look, and deliberately so — mixing the two conventions in one app makes
+whichever you meet second feel inverted.
 
 All four passes live in one file behind `#ifdef` guards and are compiled from it
 once each with `-D`, so the whole effect still reloads as a unit when you save:
@@ -239,6 +253,14 @@ are the kind of error that looks like a rendering bug:
   `Q = σ_R·κ / (3.36·G·Σ)`. Below 1 a disk fragments into bound clumps; well
   above it goes featureless. The first working version sat at Q ≈ 0.26 and
   promptly broke into half a dozen mini-galaxies.
+- **Circular speed balances on the cylindrical radius, not the spherical one.**
+  The orbit is in the plane, so the centripetal requirement is set by `R`, not
+  `|pos|`. Feeding the spherical radius in overspeeds anything whose height is
+  comparable to its radius — near the centre, everything. A particle at R=0.002
+  sitting 0.018 above the plane got `v_c(0.018) = 0.31` when it needed `0.012`,
+  and the whole core launched itself outward as an expanding ring. The 2D
+  version could not have this bug: with no thickness, `R` and `r` were the same
+  number, so it only appeared when the disk gained a third dimension.
 
 The shipped constants sit safely above the threshold. **Crossing it is the
 experiment worth running:** drop `DISPERSION` toward 0.30 or raise `DISK_MASS`

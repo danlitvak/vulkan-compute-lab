@@ -10,9 +10,10 @@ namespace fs = std::filesystem;
 namespace lab {
 namespace {
 
-// vec2 pos, vec2 vel, float mass, float pad. std430 puts the array stride at 24:
-// the struct is 24 bytes and its alignment is 8, so there is no tail padding.
-constexpr VkDeviceSize kParticleStride = 24;
+// vec4 position+mass, vec4 velocity. Packing 3D vectors into vec4 rather than
+// using vec3 is deliberate: std430 gives vec3 a 16-byte alignment anyway, so a
+// vec3 pair would occupy the same 32 bytes while hiding where the padding went.
+constexpr VkDeviceSize kParticleStride = 32;
 constexpr VkFormat kAccumFormat = VK_FORMAT_R32_UINT;
 constexpr uint32_t kTonemapGroup = 16; // matches local_size in the TONEMAP pass
 

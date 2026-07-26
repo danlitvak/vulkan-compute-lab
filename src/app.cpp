@@ -96,8 +96,12 @@ void App::onKey(GLFWwindow* window, int key, int, int action, int) {
         if (key == GLFW_KEY_P) app->sim_->setPaused(!app->sim_->paused());
     }
     if (key == GLFW_KEY_HOME) { // ease back to the default view
-        app->nav_.centerX = app->nav_.centerY = 0.0;
-        app->nav_.scale = 1.0;
+        if (app->sim_) {
+            app->resetCamera();
+        } else {
+            app->nav_.centerX = app->nav_.centerY = 0.0;
+            app->nav_.scale = 1.0;
+        }
     }
 }
 
@@ -139,6 +143,15 @@ double App::minScale() const {
 
 void App::onScroll(GLFWwindow* window, double, double yOffset) {
     auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+
+    // In a simulation the wheel trims fly speed rather than zooming: with a
+    // perspective camera you close distance by flying, and a separate zoom would
+    // just be a second, confusing way to change apparent scale.
+    if (app->sim_) {
+        app->camera_.speed = std::clamp(app->camera_.speed * std::exp(yOffset * 0.2), 0.004, 20.0);
+        return;
+    }
+
     Navigation& nav = app->nav_;
 
     const VkExtent2D extent = app->swapchain_.extent();
@@ -176,6 +189,97 @@ void App::onScroll(GLFWwindow* window, double, double yOffset) {
     nav.scale = scale;
     nav.centerX = anchorX - uvX * scale;
     nav.centerY = anchorY - uvY * scale;
+}
+
+void App::resetCamera() {
+    camera_ = Camera{};
+}
+
+// Right-handed basis from yaw/pitch, with world +z as up.
+void App::cameraBasis(float right[3], float up[3], float forward[3]) const {
+    const double cp = std::cos(camera_.pitch), sp = std::sin(camera_.pitch);
+    const double cy = std::cos(camera_.yaw), sy = std::sin(camera_.yaw);
+
+    const double fx = cp * cy, fy = cp * sy, fz = sp;
+
+    // right = normalize(forward x worldUp). Pitch is clamped away from vertical
+    // in updateCamera, so forward is never parallel to worldUp and this cross
+    // product cannot collapse.
+    double rx = fy * 1.0 - fz * 0.0;
+    double ry = fz * 0.0 - fx * 1.0;
+    double rz = fx * 0.0 - fy * 0.0;
+    const double rlen = std::sqrt(rx * rx + ry * ry + rz * rz);
+    rx /= rlen; ry /= rlen; rz /= rlen;
+
+    // up = right x forward, already unit length given the two are orthonormal.
+    const double ux = ry * fz - rz * fy;
+    const double uy = rz * fx - rx * fz;
+    const double uz = rx * fy - ry * fx;
+
+    right[0] = float(rx);   right[1] = float(ry);   right[2] = float(rz);
+    up[0] = float(ux);      up[1] = float(uy);      up[2] = float(uz);
+    forward[0] = float(fx); forward[1] = float(fy); forward[2] = float(fz);
+}
+
+void App::updateCamera(float deltaTime) {
+    // Look: the same drag-accumulates-deltas rule as the 2D path, so pressing
+    // the button contributes nothing and the view cannot jump.
+    double cursorX = 0.0, cursorY = 0.0;
+    glfwGetCursorPos(window_, &cursorX, &cursorY);
+    if (nav_.dragging) {
+        // Grab-the-world, not FPS look: dragging right moves the scene right,
+        // which means the camera turns left. This matches the 2D pan, where the
+        // image follows the cursor. FPS-style look (turn right when dragging
+        // right) reads as inverted to anyone coming from the other mode.
+        constexpr double kLookSpeed = 0.0035; // radians per pixel
+        camera_.yaw += (cursorX - nav_.lastCursorX) * kLookSpeed;
+        camera_.pitch += (cursorY - nav_.lastCursorY) * kLookSpeed;
+        constexpr double kPitchLimit = 1.5533; // 89 degrees
+        camera_.pitch = std::clamp(camera_.pitch, -kPitchLimit, kPitchLimit);
+    }
+    nav_.lastCursorX = cursorX;
+    nav_.lastCursorY = cursorY;
+
+    float right[3], up[3], forward[3];
+    cameraBasis(right, up, forward);
+
+    // Movement is polled, not event-driven: key callbacks fire on press and
+    // repeat, which would make held-key motion stutter at the OS repeat rate.
+    const auto held = [this](int key) { return glfwGetKey(window_, key) == GLFW_PRESS; };
+    double moveF = 0.0, moveR = 0.0, moveU = 0.0;
+    if (held(GLFW_KEY_W)) moveF += 1.0;
+    if (held(GLFW_KEY_S)) moveF -= 1.0;
+    if (held(GLFW_KEY_D)) moveR += 1.0;
+    if (held(GLFW_KEY_A)) moveR -= 1.0;
+    if (held(GLFW_KEY_E)) moveU += 1.0;
+    if (held(GLFW_KEY_Q)) moveU -= 1.0;
+
+    double speed = camera_.speed;
+    if (held(GLFW_KEY_LEFT_SHIFT) || held(GLFW_KEY_RIGHT_SHIFT)) speed *= 4.0;
+    if (held(GLFW_KEY_LEFT_CONTROL) || held(GLFW_KEY_RIGHT_CONTROL)) speed *= 0.25;
+
+    double desiredX = forward[0] * moveF + right[0] * moveR;
+    double desiredY = forward[1] * moveF + right[1] * moveR;
+    double desiredZ = forward[2] * moveF + right[2] * moveR + moveU;
+
+    // Normalise so diagonals are not faster than the axes.
+    const double length = std::sqrt(desiredX * desiredX + desiredY * desiredY + desiredZ * desiredZ);
+    if (length > 1e-9) {
+        desiredX = desiredX / length * speed;
+        desiredY = desiredY / length * speed;
+        desiredZ = desiredZ / length * speed;
+    } else {
+        desiredX = desiredY = desiredZ = 0.0;
+    }
+
+    const double alpha = 1.0 - std::exp(-12.0 * double(deltaTime));
+    camera_.velX += (desiredX - camera_.velX) * alpha;
+    camera_.velY += (desiredY - camera_.velY) * alpha;
+    camera_.velZ += (desiredZ - camera_.velZ) * alpha;
+
+    camera_.x += camera_.velX * deltaTime;
+    camera_.y += camera_.velY * deltaTime;
+    camera_.z += camera_.velZ * deltaTime;
 }
 
 void App::updateNavigation(float deltaTime) {
@@ -534,7 +638,11 @@ bool App::drawFrame() {
     lastFrameTime_ = now;
 
     const VkExtent2D extent = swapchain_.extent();
-    updateNavigation(deltaTime);
+    if (sim_) {
+        updateCamera(deltaTime);
+    } else {
+        updateNavigation(deltaTime);
+    }
 
     PushConstants push{};
     push.resolution[0] = static_cast<float>(extent.width);
@@ -565,6 +673,14 @@ bool App::drawFrame() {
         static_assert(sizeof(simPush) >= sizeof(push), "sim push must extend the standard block");
         std::memcpy(&simPush, &push, sizeof(push)); // identical leading layout
         simPush.particleCount = sim_->particleCount();
+
+        constexpr float kFovDegrees = 60.0f;
+        simPush.fovScale = std::tan(kFovDegrees * 0.5f * 3.14159265f / 180.0f);
+        simPush.camPos[0] = float(camera_.x);
+        simPush.camPos[1] = float(camera_.y);
+        simPush.camPos[2] = float(camera_.z);
+        cameraBasis(simPush.camRight, simPush.camUp, simPush.camForward);
+
         sim_->record(frame.cmd, frameIndex_, simPush);
     } else {
         vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
@@ -789,10 +905,10 @@ void App::updateTitle(double now) {
 
     const double fps = framesSinceTitleUpdate_ / (now - lastTitleUpdate_);
     const VkExtent2D extent = swapchain_.extent();
-    char detail[96] = "";
+    char detail[128] = "";
     if (sim_)
-        std::snprintf(detail, sizeof(detail), " — %u bodies%s", sim_->particleCount(),
-                      sim_->paused() ? " (paused)" : "");
+        std::snprintf(detail, sizeof(detail), " — %u bodies%s — speed %.3f", sim_->particleCount(),
+                      sim_->paused() ? " (paused)" : "", camera_.speed);
     char title[320];
     std::snprintf(title, sizeof(title), "vulkan-compute-lab — %s%s — %ux%u — %.0f fps",
                   shaderPath_.filename().string().c_str(), detail, extent.width, extent.height, fps);

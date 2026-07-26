@@ -1,8 +1,9 @@
 #version 450
 
-// N-body galaxy: an exponential stellar disk orbiting inside a static dark
-// matter halo. The directive below tells the host how many particles to
-// allocate, and its presence is what switches on the simulation path.
+// 3D N-body galaxy: an exponential stellar disk with real vertical thickness,
+// orbiting inside a static dark matter halo, viewed through a free-fly camera.
+// The directive below tells the host how many particles to allocate, and its
+// presence is what switches on the simulation path.
 //
 //!nbody 131072
 //!alias gravity grav nbody stars
@@ -15,22 +16,26 @@
 //
 //   PASS_SEED       initial conditions, one invocation per particle
 //   PASS_INTEGRATE  all-pairs gravity with shared-memory tiling
-//   PASS_RENDER     splat particles into a count image with atomics
+//   PASS_RENDER     perspective-project and splat into a count image
 //   PASS_TONEMAP    counts -> colour, and zero the counts for the next frame
 //
 // Every constant below is a plain `const`: edit, save, and the simulation keeps
-// running with the new values. Space reseeds, P pauses, drag/scroll moves the
-// camera.
+// running with the new values. Drag to look, WASD to fly, Q/E down/up, shift to
+// boost, scroll to trim speed, Space to reseed, P to pause.
+//
+// World is z-up with the disk in the xy plane, so z is height above the disk.
 
 // ---------------------------------------------------------------- tunables --
 
 const float G          = 1.0;     // gravitational constant, in sim units
 const float DISK_MASS  = 0.35;    // total mass carried by the particles
 const float DISK_SCALE = 0.16;    // exponential scale length
-// Softening does double duty: it caps the 1/r^2 blowup, and in a razor-thin 2D
-// disk it stands in for the vertical thickness a real disk has. Too small and
-// the disk fragments into bound clumps through two-body scattering.
-const float SOFTENING  = 0.022;
+const float DISK_HEIGHT = 0.018;  // vertical scale height; the disk is ~9:1 flat
+
+// Softening caps the 1/r^2 blowup. In 3D it no longer has to stand in for
+// thickness the way it did in the 2D version, so it can be smaller and the core
+// stays sharper.
+const float SOFTENING  = 0.010;
 const float DT         = 0.0010;  // fixed step; real frame time is far too jittery
 
 // Toomre Q = sigma_R * kappa / (3.36 * G * Sigma) decides what the disk does.
@@ -40,35 +45,36 @@ const float DT         = 0.0010;  // fixed step; real frame time is far too jitt
 // Two knobs move Q: this dispersion (numerator) and DISK_MASS, since Q goes as
 // 1/Sigma. A light disk inside a dominant halo is the stable configuration.
 //
-// The default sits safely above the threshold. Crossing it is the experiment
-// worth running: drop this toward 0.30, or raise DISK_MASS toward 1.0, save, and
-// watch the disk go unstable and fragment into bound clumps within a few hundred
-// steps. Hot reload keeps the particles, so the disk destabilises in place.
-const float DISPERSION = 0.45;    // random velocity as a fraction of circular
+// The default sits above the threshold. Crossing it is the experiment worth
+// running: drop this toward 0.20, or raise DISK_MASS toward 1.0, save, and watch
+// the disk fragment within a few hundred steps. Hot reload keeps the particles,
+// so it destabilises in place.
+const float DISPERSION = 0.38;    // random velocity as a fraction of circular
 
 // A static analytic halo rather than more particles. Real disks need one: the
 // visible mass alone gives a falling rotation curve, and a self-gravitating cold
-// disk with no halo just collapses into a bar. This is also what produces
-// differential rotation, and therefore spiral structure.
-// A heavier halo also lowers the disk's self-gravity fraction, which is the
-// other half of keeping it from fragmenting.
+// disk with no halo just collapses into a bar. A heavier halo also lowers the
+// disk's self-gravity fraction, which is the other half of staying stable.
 const float HALO_MASS  = 6.0;     // Plummer sphere, several times the disk
 const float HALO_SCALE = 0.55;
 
-const float SPLAT_SIGMA = 1.1;    // particle point-spread, in pixels
+const float SPLAT_SIGMA = 1.0;    // particle point-spread, in pixels
 const float EXPOSURE    = 0.055;  // brightness per unit of deposited weight
-const float LOG_RANGE   = 5.0;    // decades of density the ramp spans; lower = more contrast
+const float LOG_RANGE   = 5.0;    // decades of density the ramp spans
+const float NEAR_PLANE  = 0.004;  // ignore particles closer than this
+const float REF_DIST    = 0.55;   // distance at which a star has unit brightness
 
 const float TAU = 6.28318530718;
 const uint  WEIGHT_SCALE = 1024u; // fixed-point denominator for atomic deposits
 
 // ------------------------------------------------------------------ layout --
 
+// xyz + mass, then xyz velocity. vec4 rather than vec3 because std430 gives a
+// vec3 16-byte alignment anyway — this way the padding is visible and the mass
+// rides along for free.
 struct Particle {
-    vec2  pos;
-    vec2  vel;
-    float mass;
-    float _pad;
+    vec4 posMass;
+    vec4 vel;
 };
 
 layout(binding = 0, rgba8) uniform writeonly image2D target;
@@ -85,11 +91,16 @@ layout(push_constant) uniform Push {
     float deltaTime;
     uint  frame;
     uint  particleCount;
+    float fovScale;      // tan(fov / 2)
+    vec4  camPos;
+    vec4  camRight;
+    vec4  camUp;
+    vec4  camForward;
 } pc;
 
-// Mass enclosed within r for an exponential disk of unit total mass. This is the
-// integral of the same profile SEED samples from, so the rotation curve and the
-// particle distribution cannot drift out of agreement.
+// Mass enclosed within spherical radius r for an exponential disk of unit total
+// mass. This is the integral of the same profile SEED samples from, so the
+// rotation curve and the particle distribution cannot drift out of agreement.
 float diskEnclosed(float r) {
     float x = r / DISK_SCALE;
     return 1.0 - (1.0 + x) * exp(-x);
@@ -101,19 +112,13 @@ float diskEnclosed(float r) {
 // This matters more than it looks. Inside the softening radius the real force is
 // Plummer-softened and much weaker than 1/r^2, so seeding from unsoftened
 // gravity hands core particles several times the speed they need and the centre
-// promptly flings itself outward, leaving a hole. Both terms here go to zero as
+// promptly flings itself outward, leaving a hole. Both terms go to zero as
 // r -> 0, which is the solid-body rotation a softened core should have.
 float circularSpeedSquared(float r) {
     float r2 = r * r;
     float disk = DISK_MASS * diskEnclosed(r) * r2 / pow(r2 + SOFTENING * SOFTENING, 1.5);
     float halo = HALO_MASS * r2 / pow(r2 + HALO_SCALE * HALO_SCALE, 1.5);
     return G * (disk + halo);
-}
-
-// World -> screen. The inverse of the mapping the pixel shaders use, so the same
-// drag-and-scroll navigation drives this camera unchanged.
-vec2 worldToPixel(vec2 world) {
-    return (world - pc.center) * pc.zoom * pc.resolution.y + 0.5 * pc.resolution;
 }
 
 // ================================================================== SEED ====
@@ -135,32 +140,43 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.particleCount) return;
 
-    float u1 = max(rnd(i * 5u + 0u), 1e-7);
-    float u2 = max(rnd(i * 5u + 1u), 1e-7);
-    float u3 = rnd(i * 5u + 2u);
-    float u4 = rnd(i * 5u + 3u);
-    float u5 = rnd(i * 5u + 4u);
+    float u1 = max(rnd(i * 8u + 0u), 1e-7);
+    float u2 = max(rnd(i * 8u + 1u), 1e-7);
+    float u3 = rnd(i * 8u + 2u);
+    float u4 = max(rnd(i * 8u + 3u), 1e-7);
+    float u5 = rnd(i * 8u + 4u);
+    float u6 = rnd(i * 8u + 5u);
+    float u7 = rnd(i * 8u + 6u);
+    float u8 = rnd(i * 8u + 7u);
 
-    // Surface density ~ exp(-r/Rd) makes the radial PDF proportional to
-    // r*exp(-r/Rd), which is Gamma(2) — and a Gamma(2) sample is just the sum of
+    // Surface density ~ exp(-R/Rd) makes the radial PDF proportional to
+    // R*exp(-R/Rd), which is Gamma(2) — and a Gamma(2) sample is just the sum of
     // two exponentials, so no rejection sampling is needed.
-    float r = -DISK_SCALE * (log(u1) + log(u2));
+    float R = -DISK_SCALE * (log(u1) + log(u2));
     float a = u3 * TAU;
-    vec2 pos = vec2(cos(a), sin(a)) * r;
 
-    // Balances against everything inside r, disk *and* halo, softened exactly the
-    // way the integrator softens it. Leaving the halo out here makes the disk
-    // under-rotate and fall inward; ignoring the softening blows out the core.
-    float vc = sqrt(circularSpeedSquared(r));
+    // Two-sided exponential in z gives the disk its thickness. Without this the
+    // galaxy is a razor-thin sheet, which looks like paper from any angle but
+    // face-on — the whole reason the camera is worth having.
+    float h = -DISK_HEIGHT * log(u4) * (u5 < 0.5 ? -1.0 : 1.0);
 
-    vec2 vel = vec2(-sin(a), cos(a)) * vc;
-    vel += (vec2(u4, u5) - 0.5) * vc * DISPERSION;
+    vec3 pos = vec3(cos(a) * R, sin(a) * R, h);
+
+    // Balance on the CYLINDRICAL radius, not the spherical one. The orbit is in
+    // the plane, so centripetal acceleration is set by R; feeding length(pos) in
+    // here overspeeds anything whose height is comparable to its radius, which
+    // near the centre is everything. A particle at R=0.002 sitting h=0.018 above
+    // the plane would get v_c(0.018) = 0.31 when it needs 0.012, and the entire
+    // core launches itself outward as an expanding ring. The 2D version could not
+    // have this bug: with no thickness, R and r were the same number.
+    float vc = sqrt(circularSpeedSquared(R));
+
+    vec3 vel = vec3(-sin(a), cos(a), 0.0) * vc;
+    vel += (vec3(u6, u7, u8) - 0.5) * vc * DISPERSION;
 
     Particle p;
-    p.pos  = pos;
-    p.vel  = vel;
-    p.mass = DISK_MASS / float(pc.particleCount);
-    p._pad = 0.0;
+    p.posMass = vec4(pos, DISK_MASS / float(pc.particleCount));
+    p.vel     = vec4(vel, 0.0);
 
     // Both buffers, so the first integrate step reads valid data whichever
     // parity it happens to start on.
@@ -187,24 +203,24 @@ void main() {
     // run the loop with a harmless zero-mass body instead of returning early.
     // (`active` is a reserved word in GLSL, hence the name.)
     bool inRange = i < count;
-    vec2 p = inRange ? bufIn[i].pos : vec2(0.0);
-    vec2 v = inRange ? bufIn[i].vel : vec2(0.0);
+    vec3 p = inRange ? bufIn[i].posMass.xyz : vec3(0.0);
+    vec3 v = inRange ? bufIn[i].vel.xyz : vec3(0.0);
 
-    vec2 acc = vec2(0.0);
+    vec3 acc = vec3(0.0);
     uint tiles = (count + 255u) / 256u;
 
     for (uint t = 0u; t < tiles; ++t) {
         uint src = t * 256u + local;
-        tile[local] = src < count ? vec4(bufIn[src].pos, bufIn[src].mass, 0.0) : vec4(0.0);
+        tile[local] = src < count ? bufIn[src].posMass : vec4(0.0);
         barrier();
 
         for (uint j = 0u; j < 256u; ++j) {
-            vec2  d    = tile[j].xy - p;
+            vec3  d    = tile[j].xyz - p;
             float d2   = dot(d, d) + SOFTENING * SOFTENING;
             float invD = inversesqrt(d2);
             // Padding entries carry mass 0 and self-interaction has d == 0, so
             // both drop out without needing a branch.
-            acc += d * (G * tile[j].z * invD * invD * invD);
+            acc += d * (G * tile[j].w * invD * invD * invD);
         }
         barrier();
     }
@@ -222,10 +238,8 @@ void main() {
     p += v * DT;
 
     Particle result;
-    result.pos  = p;
-    result.vel  = v;
-    result.mass = bufIn[i].mass;
-    result._pad = 0.0;
+    result.posMass = vec4(p, bufIn[i].posMass.w);
+    result.vel     = vec4(v, 0.0);
     bufOut[i] = result;
 }
 #endif
@@ -238,12 +252,28 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.particleCount) return;
 
-    vec2 px = worldToPixel(bufOut[i].pos);
+    // World -> camera. The basis arrives orthonormal from the host, so this is a
+    // transpose-multiply rather than a full inverse.
+    vec3 rel = bufOut[i].posMass.xyz - pc.camPos.xyz;
+    float z = dot(rel, pc.camForward.xyz);
+    if (z < NEAR_PLANE) return; // behind the camera, or close enough to smear
 
-    // Splat over a small kernel rather than one pixel. A galaxy's disk covers far
-    // more pixels than it has particles, so single-pixel deposits render as
-    // scattered dots; giving each particle a point-spread makes the light
-    // distribution continuous the way an actual telescope image is.
+    float x = dot(rel, pc.camRight.xyz);
+    float y = dot(rel, pc.camUp.xyz);
+
+    // Perspective divide, expressed in half-screen-heights so the horizontal
+    // field of view widens with the aspect ratio instead of squashing.
+    vec2 ndc = vec2(x, y) / (z * pc.fovScale);
+    vec2 px = 0.5 * pc.resolution + vec2(ndc.x, -ndc.y) * (0.5 * pc.resolution.y);
+
+    // Inverse-square falloff, bounded. Unbounded 1/z^2 blows out to a white
+    // screen the moment the camera clips a star.
+    float attenuation = min((REF_DIST * REF_DIST) / (z * z), 6.0);
+
+    // Splat over a small kernel rather than one pixel. The disk covers far more
+    // pixels than it has particles, so single-pixel deposits render as scattered
+    // dots; a point-spread makes the light continuous, the way a real telescope
+    // image is.
     ivec2 base = ivec2(floor(px));
     float inv2Sigma2 = 1.0 / (2.0 * SPLAT_SIGMA * SPLAT_SIGMA);
 
@@ -253,10 +283,10 @@ void main() {
             if (c.x < 0 || c.y < 0 || c.x >= int(pc.resolution.x) || c.y >= int(pc.resolution.y))
                 continue;
 
-            // Offset from the particle's true sub-pixel position, so the splat
-            // does not jitter as the particle crosses a pixel boundary.
+            // Offset from the true sub-pixel position, so the splat does not
+            // jitter as the particle crosses a pixel boundary.
             vec2 delta = (vec2(c) + 0.5) - px;
-            float w = exp(-dot(delta, delta) * inv2Sigma2);
+            float w = exp(-dot(delta, delta) * inv2Sigma2) * attenuation;
             uint weight = uint(w * float(WEIGHT_SCALE));
             if (weight > 0u) imageAtomicAdd(accum, c, weight);
         }

@@ -122,6 +122,23 @@ private:
     double minScale() const; // the deepest zoom fp32 coordinates still resolve
     bool zoomClampReported_{false};
 
+    // Free-fly camera, used whenever a simulation is running. Pixel shaders keep
+    // the 2D centre/zoom navigation above; the two never apply at once.
+    //
+    // World is z-up with the galactic disk in the xy plane, which is the usual
+    // convention for a disk galaxy and makes "height above the disk" just z.
+    struct Camera {
+        double x{0.0}, y{-0.95}, z{0.42};
+        double yaw{1.5707963};   // radians, measured in the xy plane
+        double pitch{-0.42};     // radians, clamped away from straight up/down
+        double speed{0.35};      // world units per second
+        double velX{0.0}, velY{0.0}, velZ{0.0}; // smoothed, for a little inertia
+    } camera_;
+
+    void updateCamera(float deltaTime);
+    void cameraBasis(float right[3], float up[3], float forward[3]) const;
+    void resetCamera();
+
     Options options_;
     std::filesystem::path shaderPath_;
     std::filesystem::file_time_type shaderWriteTime_{};

@@ -21,9 +21,12 @@ void printUsage() {
         "  --capture <file.png>    save a frame to file.png\n"
         "  --frames <n>            frames to render before capturing (default 60)\n"
         "  --exit-after-capture    quit once the capture is written\n"
+        "  --pan <x> <y>           starting pan, in units of screen height\n"
+        "  --zoom <z>              starting zoom (1.0 = default view)\n"
         "  --help\n"
         "\n"
-        "keys: R reload shader, F12 screenshot, Esc quit\n"
+        "mouse: drag to pan, scroll to zoom (about the cursor)\n"
+        "keys:  R reload shader, Home reset view, F12 screenshot, Esc quit\n"
         "the shader also reloads on its own whenever the file changes on disk\n");
 }
 
@@ -51,6 +54,11 @@ int main(int argc, char** argv) {
             options.captureAfterFrames = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--exit-after-capture") {
             options.exitAfterCapture = true;
+        } else if (arg == "--pan" && i + 2 < argc) {
+            options.panX = std::strtod(argv[++i], nullptr);
+            options.panY = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--zoom" && hasValue) {
+            options.zoom = std::strtod(argv[++i], nullptr);
         } else if (!arg.empty() && arg.front() == '-') {
             std::fprintf(stderr, "[lab] unknown option: %s\n", arg.c_str());
             printUsage();

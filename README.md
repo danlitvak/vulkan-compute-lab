@@ -8,9 +8,11 @@ an offscreen storage image, and that image is blitted straight to the swapchain.
 No render pass, no framebuffers, no vertex or fragment stages.
 
 ![mandelbrot](docs/mandelbrot.png)
+![the same shader zoomed 400x](docs/deepzoom.png)
 ![domain-warped noise](docs/warp.png)
 
-*Both frames captured by the app itself with `--capture`.*
+*Every frame here was captured by the app itself with `--capture`. The middle one
+is the same shader as the first, zoomed 400x.*
 
 ## Run it
 
@@ -26,11 +28,13 @@ the CMake and Ninja that ship inside it — nothing needs to be on `PATH`.
 .\build.ps1 -Config Release -Run              # no validation layers
 ```
 
-| Key | |
+| | |
 |---|---|
+| drag | pan |
+| scroll | zoom, about the cursor |
+| `Home` | ease back to the default view |
 | `R` | force a shader reload |
 | `F12` | screenshot to `capture-NNN.png` |
-| drag | feed the cursor to the shader's `mouse` uniform |
 | `Esc` | quit |
 
 Saving the shader file reloads it on its own; `R` is only for when you want to
@@ -38,14 +42,46 @@ re-run the compile without touching the file.
 
 ```
 lab.exe [shader.comp] [--capture out.png] [--frames N] [--exit-after-capture]
+                      [--pan <x> <y>] [--zoom <z>]
 ```
 
 `--capture` is how the images in this README were made, and how the renderer gets
 verified without a human looking at a window.
 
+`--pan` and `--zoom` set the starting view, so a capture can be framed
+reproducibly instead of dragged there by hand:
+
+```powershell
+lab.exe --zoom 400 --capture deep.png --frames 30 --exit-after-capture
+```
+
 The PNG writer in `src/png.cpp` has no dependencies, which it pays for by using
 stored (uncompressed) deflate blocks — a 1280x720 capture lands around 3.7 MB.
 Correct PNG, just large; recompress anything you intend to share.
+
+## Interaction
+
+Two uniforms that look similar are deliberately kept apart, because mixing them
+is what makes a viewport feel broken:
+
+- **`mouse`** is the raw pointer, normalised, always live. It is only ever read,
+  never re-anchored, so it cannot jump.
+- **`pan` and `zoom`** are navigation state, accumulated from cursor *deltas*.
+  Pressing the button contributes exactly zero by construction, and on press the
+  drag anchor is reset so the first frame of a drag cannot apply the distance the
+  cursor travelled since the last drag ended.
+
+The earlier version conflated the two — it fed the window centre into `mouse`
+until a button went down, then the cursor position — and pressing the mouse
+visibly teleported the image. Absolute values are fine to read and dangerous to
+re-anchor; relative values are safe to accumulate. That is the whole rule.
+
+Both are smoothed toward their targets with `1 - exp(-rate * dt)` rather than a
+plain per-frame lerp, so the feel does not change with frame rate.
+
+Zoom is applied about the cursor, not the window centre: the host solves for the
+pan that keeps the point under the pointer fixed, which is the difference between
+zooming *into what you are looking at* and having it slide out of frame.
 
 ## Writing a shader
 
@@ -57,11 +93,31 @@ layout(binding = 0, rgba8) uniform writeonly image2D target;
 
 layout(push_constant) uniform Push {
     vec2  resolution;
-    vec2  mouse;      // pixels, top-left origin; window centre unless dragging
+    vec2  mouse;      // normalised 0..1, y down; always the live cursor
+    vec2  pan;        // accumulated drag, in units of screen height
+    float zoom;       // 1.0 at rest, larger as you scroll in
     float time;       // seconds since start
     float deltaTime;
     uint  frame;
 } pc;
+```
+
+To make a shader navigable, map pixels through `pan` and `zoom`:
+
+```glsl
+vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
+vec2 p  = (uv - pc.pan) / pc.zoom;
+```
+
+Applying `pan` before dividing by `zoom` is what makes a drag move the image 1:1
+with the cursor at any zoom level. Reverse the order and dragging gets slower as
+you zoom in.
+
+If the shader resolves more detail as it zooms — anything iterative — scale the
+work with `zoom`, or deep views quietly degrade. `mandelbrot.comp` does this:
+
+```glsl
+int maxIter = int(min(2000.0, 320.0 + 140.0 * log2(max(pc.zoom, 1.0))));
 ```
 
 Guard against the overhang — the dispatch is rounded up to whole workgroups, so
@@ -114,11 +170,13 @@ src/
   context.cpp          instance, debug messenger, device, queue, command pool
   swapchain.cpp        surface format/present mode choice, present-only swapchain
   shader_compiler.cpp  runs glslc at runtime; this is what makes reload work
-  app.cpp              storage images, descriptors, pipeline, frame loop, capture
+  app.cpp              storage images, descriptors, pipeline, frame loop,
+                       navigation, capture
   png.cpp              dependency-free PNG writer for screenshots
 shaders/
-  mandelbrot.comp      smooth-iteration Mandelbrot with a breathing zoom
+  mandelbrot.comp      smooth-iteration Mandelbrot, iteration count scaled by zoom
   warp.comp            domain-warped value noise
+docs/                  README captures, produced with --capture
 ```
 
 Shaders are compiled at **runtime**, not build time — that is the whole point of

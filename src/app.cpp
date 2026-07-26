@@ -6,6 +6,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -41,7 +43,13 @@ void imageBarrier(VkCommandBuffer cmd, VkImage image, VkPipelineStageFlags srcSt
 
 } // namespace
 
-App::App(Options options) : options_(std::move(options)), shaderPath_(options_.shader) {}
+App::App(Options options) : options_(std::move(options)), shaderPath_(options_.shader) {
+    // Seed both the target and the smoothed value, so a requested starting view
+    // is already in place on frame zero instead of easing into it.
+    nav_.panX = nav_.smoothPanX = options_.panX;
+    nav_.panY = nav_.smoothPanY = options_.panY;
+    nav_.zoomExponent = nav_.smoothZoomExponent = std::log(std::max(options_.zoom, 1e-6));
+}
 
 void App::run() {
     initWindow();
@@ -63,6 +71,8 @@ void App::initWindow() {
     glfwSetWindowUserPointer(window_, this);
     glfwSetFramebufferSizeCallback(window_, onFramebufferResize);
     glfwSetKeyCallback(window_, onKey);
+    glfwSetMouseButtonCallback(window_, onMouseButton);
+    glfwSetScrollCallback(window_, onScroll);
 }
 
 void App::onFramebufferResize(GLFWwindow* window, int, int) {
@@ -75,6 +85,74 @@ void App::onKey(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
     if (key == GLFW_KEY_R) app->reloadRequested_ = true;
     if (key == GLFW_KEY_F12) app->screenshotRequested_ = true;
+    if (key == GLFW_KEY_HOME) { // ease back to the default view
+        app->nav_.panX = app->nav_.panY = 0.0;
+        app->nav_.zoomExponent = 0.0;
+    }
+}
+
+void App::onMouseButton(GLFWwindow* window, int button, int action, int) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+
+    if (action == GLFW_PRESS) {
+        // Re-anchor on press. Without this the first frame of a drag applies the
+        // distance the cursor travelled since the last drag ended, which is the
+        // jump this design exists to avoid.
+        glfwGetCursorPos(window, &app->nav_.lastCursorX, &app->nav_.lastCursorY);
+        app->nav_.dragging = true;
+    } else if (action == GLFW_RELEASE) {
+        app->nav_.dragging = false;
+    }
+}
+
+void App::onScroll(GLFWwindow* window, double, double yOffset) {
+    auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+    Navigation& nav = app->nav_;
+
+    const double previousZoom = std::exp(nav.zoomExponent);
+    nav.zoomExponent += yOffset * 0.15;
+    const double zoom = std::exp(nav.zoomExponent);
+
+    // Zoom about the cursor rather than the window centre: solve for the pan
+    // that keeps the point currently under the pointer where it is.
+    //   shader maps uv -> (uv - pan) / zoom
+    //   so pan' = uv_cursor - (zoom' / zoom) * (uv_cursor - pan)
+    const VkExtent2D extent = app->swapchain_.extent();
+    if (extent.height == 0) return;
+
+    double cursorX = 0.0, cursorY = 0.0;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const double height = extent.height;
+    const double uvX = (cursorX - 0.5 * extent.width) / height;
+    const double uvY = (cursorY - 0.5 * height) / height;
+
+    const double ratio = zoom / previousZoom;
+    nav.panX = uvX - ratio * (uvX - nav.panX);
+    nav.panY = uvY - ratio * (uvY - nav.panY);
+}
+
+void App::updateNavigation(float deltaTime) {
+    const VkExtent2D extent = swapchain_.extent();
+    const double height = extent.height > 0 ? extent.height : 1.0;
+
+    double cursorX = 0.0, cursorY = 0.0;
+    glfwGetCursorPos(window_, &cursorX, &cursorY);
+
+    if (nav_.dragging) {
+        // Deltas, not absolute position. This is the whole trick.
+        nav_.panX += (cursorX - nav_.lastCursorX) / height;
+        nav_.panY += (cursorY - nav_.lastCursorY) / height;
+    }
+    nav_.lastCursorX = cursorX;
+    nav_.lastCursorY = cursorY;
+
+    // Frame-rate independent exponential smoothing, so the feel does not change
+    // with frame rate the way a plain per-frame lerp would.
+    const double alpha = 1.0 - std::exp(-18.0 * double(deltaTime));
+    nav_.smoothPanX += (nav_.panX - nav_.smoothPanX) * alpha;
+    nav_.smoothPanY += (nav_.panY - nav_.smoothPanY) * alpha;
+    nav_.smoothZoomExponent += (nav_.zoomExponent - nav_.smoothZoomExponent) * alpha;
 }
 
 // ---------------------------------------------------------------- vulkan ----
@@ -345,19 +423,16 @@ bool App::drawFrame() {
     lastFrameTime_ = now;
 
     const VkExtent2D extent = swapchain_.extent();
+    updateNavigation(deltaTime);
 
-    // Only follow the cursor while dragging. Otherwise the mouse parks wherever
-    // it happens to be — including outside the window — and every shader that
-    // reads it starts off-centre for no visible reason.
-    double mouseX = extent.width * 0.5;
-    double mouseY = extent.height * 0.5;
-    if (glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
-        glfwGetCursorPos(window_, &mouseX, &mouseY);
     PushConstants push{};
     push.resolution[0] = static_cast<float>(extent.width);
     push.resolution[1] = static_cast<float>(extent.height);
-    push.mouse[0] = static_cast<float>(mouseX);
-    push.mouse[1] = static_cast<float>(mouseY);
+    push.mouse[0] = extent.width > 0 ? static_cast<float>(nav_.lastCursorX / extent.width) : 0.0f;
+    push.mouse[1] = extent.height > 0 ? static_cast<float>(nav_.lastCursorY / extent.height) : 0.0f;
+    push.pan[0] = static_cast<float>(nav_.smoothPanX);
+    push.pan[1] = static_cast<float>(nav_.smoothPanY);
+    push.zoom = static_cast<float>(std::exp(nav_.smoothZoomExponent));
     push.time = static_cast<float>(now - startTime_);
     push.deltaTime = deltaTime;
     push.frame = frameCounter_;

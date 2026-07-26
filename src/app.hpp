@@ -13,19 +13,33 @@ namespace lab {
 
 // Mirrored by the `Push` block in every .comp shader. Keep the two in sync:
 // std430 push-constant rules put these at the same offsets as the C++ struct.
+//
+// `mouse` is the raw pointer and `pan`/`zoom` are navigation state. Keeping them
+// separate is what stops a click from jumping the image: absolute values are
+// only ever read, never re-anchored, and navigation only ever accumulates
+// deltas, so pressing a button contributes exactly zero.
 struct PushConstants {
     float resolution[2];
-    float mouse[2];
+    float mouse[2]; // normalised 0..1, y down, always live
+    float pan[2];   // accumulated drag, in units of screen height
+    float zoom;     // 1.0 at rest, grows as you scroll in
     float time;
     float deltaTime;
     uint32_t frame;
 };
+
+static_assert(sizeof(PushConstants) == 40, "shader Push block must match this layout");
 
 struct Options {
     std::filesystem::path shader;
     std::filesystem::path capturePath;      // empty: no automatic capture
     uint32_t captureAfterFrames{60};        // let the animation get somewhere first
     bool exitAfterCapture{false};
+    // Starting view, so a capture can be framed reproducibly instead of having
+    // to be dragged there by hand.
+    double panX{0.0};
+    double panY{0.0};
+    double zoom{1.0};
 };
 
 class App {
@@ -72,6 +86,21 @@ private:
 
     static void onFramebufferResize(GLFWwindow* window, int width, int height);
     static void onKey(GLFWwindow* window, int key, int scancode, int action, int mods);
+    static void onMouseButton(GLFWwindow* window, int button, int action, int mods);
+    static void onScroll(GLFWwindow* window, double xOffset, double yOffset);
+
+    void updateNavigation(float deltaTime);
+
+    // Drag-to-pan, scroll-to-zoom. Targets are what input writes; the smoothed
+    // values are what the shader sees, so motion eases instead of snapping.
+    struct Navigation {
+        double panX{0.0}, panY{0.0};
+        double smoothPanX{0.0}, smoothPanY{0.0};
+        double zoomExponent{0.0}; // zoom == exp(zoomExponent)
+        double smoothZoomExponent{0.0};
+        double lastCursorX{0.0}, lastCursorY{0.0};
+        bool dragging{false};
+    } nav_;
 
     Options options_;
     std::filesystem::path shaderPath_;

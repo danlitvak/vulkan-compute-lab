@@ -10,14 +10,22 @@ layout(binding = 0, rgba8) uniform writeonly image2D target;
 // Offsets must match the PushConstants struct in src/app.hpp.
 layout(push_constant) uniform Push {
     vec2  resolution;
-    vec2  mouse;
+    vec2  mouse;      // normalised 0..1, y down
+    vec2  pan;        // drag offset, in units of screen height
+    float zoom;       // 1.0 at rest
     float time;
     float deltaTime;
     uint  frame;
 } pc;
 
-const int   MAX_ITER = 480;
 const float BAILOUT2 = 256.0; // squared escape radius
+
+// Drag to pan, scroll to zoom, Home to reset. The host accumulates pan from
+// cursor deltas, so this is continuous no matter when a drag starts or ends.
+vec2 viewCoord(ivec2 pixel) {
+    vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
+    return (uv - pc.pan) / pc.zoom;
+}
 
 // Iñigo Quílez cosine palette.
 vec3 palette(float t) {
@@ -36,25 +44,21 @@ void main() {
     // column of invocations can fall outside the image.
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
-    vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
+    vec2 c = vec2(-0.743643887037151, 0.131825904205330) + viewCoord(pixel) * 2.4;
 
-    // Breathe between a wide view and a deep zoom.
-    float phase = 0.5 - 0.5 * cos(pc.time * 0.18);
-    float scale = 2.4 * exp(-6.0 * phase);
-
-    // The mouse nudges the target point, so live uniforms are visible.
-    vec2 pan = (pc.mouse / pc.resolution - 0.5) * 0.35 * scale;
-    vec2 c   = vec2(-0.743643887037151, 0.131825904205330) + pan + uv * scale;
+    // More iterations as you zoom in, or deep views collapse to solid black:
+    // the escape-time boundary needs more steps to resolve at small scales.
+    int maxIter = int(min(2000.0, 320.0 + 140.0 * log2(max(pc.zoom, 1.0))));
 
     vec2 z = vec2(0.0);
     int  i = 0;
-    for (; i < MAX_ITER; ++i) {
+    for (; i < maxIter; ++i) {
         z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
         if (dot(z, z) > BAILOUT2) break;
     }
 
     vec3 colour = vec3(0.02, 0.02, 0.03); // inside the set
-    if (i < MAX_ITER) {
+    if (i < maxIter) {
         // Fractional iteration count — without this the bands are hard edges.
         float smoothIter = float(i) + 1.0 - log2(log2(length(z)));
         colour = palette(0.030 * smoothIter + 0.05 * pc.time);

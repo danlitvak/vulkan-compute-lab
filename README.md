@@ -34,8 +34,21 @@ the CMake and Ninja that ship inside it — nothing needs to be on `PATH`.
 | scroll | zoom, about the cursor |
 | `Home` | ease back to the default view |
 | `R` | force a shader reload |
-| `F12` | screenshot to `capture-NNN.png` |
+| `F12` | screenshot, filed per shader (see below) |
 | `Esc` | quit |
+
+`F12` writes to `screenshots/<shader>/<shader>-<timestamp>.png` inside the
+project, so each shader accumulates its own directory:
+
+```
+screenshots/
+  mandelbrot/mandelbrot-20260725-143012.png
+  warp/warp-20260725-143288.png
+```
+
+Nothing is drawn into the frame to mark a capture — an overlay would be baked
+into the image. The only feedback is a line on stdout. `screenshots/` is
+gitignored; curated images belong in `docs/`.
 
 Saving the shader file reloads it on its own; `R` is only for when you want to
 re-run the compile without touching the file.

@@ -9,9 +9,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#ifndef LAB_PROJECT_DIR
+#define LAB_PROJECT_DIR "."
+#endif
 
 namespace fs = std::filesystem;
 
@@ -519,9 +524,7 @@ bool App::drawFrame() {
 void App::handleCapture() {
     if (screenshotRequested_) {
         screenshotRequested_ = false;
-        char name[64];
-        std::snprintf(name, sizeof(name), "capture-%03u.png", ++screenshotCounter_);
-        captureFrame(name);
+        captureFrame(screenshotPath());
     }
 
     const bool autoCapture = !options_.capturePath.empty() && !autoCaptureDone_ &&
@@ -531,6 +534,37 @@ void App::handleCapture() {
         captureFrame(options_.capturePath);
         if (options_.exitAfterCapture) glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
+}
+
+// screenshots/<shader>/<shader>-<timestamp>.png inside the project, so captures
+// from different shaders never pile up in one directory. Nothing is drawn into
+// the frame to indicate a capture — the image is the deliverable, and an overlay
+// would end up baked into it.
+fs::path App::screenshotPath() const {
+    const std::string stem = shaderPath_.stem().string();
+
+    // make_preferred: LAB_PROJECT_DIR arrives from CMake with forward slashes,
+    // which would otherwise log as a mix of both separators on Windows.
+    fs::path directory = (fs::path(LAB_PROJECT_DIR) / "screenshots" / stem).make_preferred();
+    std::error_code ec;
+    fs::create_directories(directory, ec);
+    if (ec) {
+        std::fprintf(stderr, "[lab] cannot create %s (%s); using the working directory\n",
+                     directory.string().c_str(), ec.message().c_str());
+        directory = fs::current_path();
+    }
+
+    const std::time_t now = std::time(nullptr);
+    const std::tm* local = std::localtime(&now);
+    char stamp[32] = "unknown-time";
+    if (local) std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", local);
+
+    // Two captures inside the same second would otherwise overwrite each other.
+    const std::string base = stem + "-" + stamp;
+    fs::path candidate = directory / (base + ".png");
+    for (int suffix = 2; fs::exists(candidate); ++suffix)
+        candidate = directory / (base + "-" + std::to_string(suffix) + ".png");
+    return candidate;
 }
 
 bool App::captureFrame(const fs::path& path) {

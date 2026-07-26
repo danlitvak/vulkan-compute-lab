@@ -26,7 +26,8 @@ void printUsage() {
         "  --help\n"
         "\n"
         "mouse: drag to pan, scroll to zoom (about the cursor)\n"
-        "keys:  R reload shader, Home reset view, F12 screenshot, Esc quit\n"
+        "keys:  R reload shader, Home reset view, Esc quit\n"
+        "       F12 screenshot -> screenshots/<shader>/<shader>-<timestamp>.png\n"
         "the shader also reloads on its own whenever the file changes on disk\n");
 }
 

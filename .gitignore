@@ -1,5 +1,8 @@
 build/
 out/
+# F12 captures. Personal output rather than project content, and a 1280x720 PNG
+# from src/png.cpp is ~3.7 MB; curated images live in docs/ instead.
+screenshots/
 .vs/
 .cache/
 *.spv

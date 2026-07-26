@@ -79,6 +79,7 @@ private:
     bool drawFrame(); // false when the frame was skipped to rebuild the swapchain
     void handleCapture();
     bool captureFrame(const std::filesystem::path& path);
+    std::filesystem::path screenshotPath() const;
     void recreateSwapchain();
     void pollShaderFile();
     void updateTitle(double now);
@@ -124,7 +125,6 @@ private:
     bool reloadRequested_{false};
     bool screenshotRequested_{false};
     bool autoCaptureDone_{false};
-    uint32_t screenshotCounter_{0};
 
     double startTime_{0.0};
     double lastFrameTime_{0.0};

@@ -46,6 +46,7 @@ endif()
 # app needs to know where they live and where glslc is.
 target_compile_definitions(lab PRIVATE
   LAB_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+  LAB_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   LAB_GLSLC_PATH="${Vulkan_GLSLC_EXECUTABLE}"
 )
 

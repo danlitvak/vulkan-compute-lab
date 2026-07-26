@@ -38,6 +38,16 @@ Nothing needs to be on `PATH`: the build locates VS Build Tools, imports the MSV
 environment, and uses the CMake and Ninja that ship inside it. A clean rebuild
 takes about 17s and an incremental one about 6s, so `.\run` is cheap to spam.
 
+To reach it from any directory, put a function in your PowerShell profile:
+
+```powershell
+function vklab { & "<path-to-repo>\run.ps1" @args }
+```
+
+Then `vklab grav` works anywhere. Avoid naming it `run` — that already resolves
+to `%LOCALAPPDATA%\nvm\run.cmd` on a machine with nvm installed, and a function
+would silently shadow it.
+
 You do **not** rebuild to change a shader. Leave the window open, edit the
 `.comp` file, save, and it swaps the pipeline within a frame or two. The build
 step only matters for C++ changes.

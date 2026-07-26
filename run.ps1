@@ -64,7 +64,9 @@ function Show-Shaders($shaders) {
         Write-Host ("  {0,-13} {1,-13} {2}" -f $s.Name, $tag, $also)
     }
     Write-Host ""
-    Write-Host "usage: .\run <name>   e.g. .\run $($shaders[0].Name)" -ForegroundColor DarkGray
+    # Reachable both as .\run from the project and as vklab from the profile
+    # function, so the hint names both rather than guessing which one was used.
+    Write-Host "usage: .\run <name>   or   vklab <name>      e.g. $($shaders[0].Name)" -ForegroundColor DarkGray
 }
 
 # Exact, then prefix, then substring, then subsequence ("mbrot" -> mandelbrot).

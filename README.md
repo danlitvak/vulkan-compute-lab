@@ -38,7 +38,9 @@ the CMake and Ninja that ship inside it — nothing needs to be on `PATH`.
 | `Esc` | quit |
 
 `F12` writes to `screenshots/<shader>/<shader>-<timestamp>.png` inside the
-project, so each shader accumulates its own directory:
+project, so each shader accumulates its own directory. The directory is created
+when the app starts and its path is printed to stdout, so you can find it before
+taking the first capture:
 
 ```
 screenshots/

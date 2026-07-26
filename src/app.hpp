@@ -79,6 +79,7 @@ private:
     bool drawFrame(); // false when the frame was skipped to rebuild the swapchain
     void handleCapture();
     bool captureFrame(const std::filesystem::path& path);
+    std::filesystem::path screenshotDirectory() const; // creates it if missing
     std::filesystem::path screenshotPath() const;
     void recreateSwapchain();
     void pollShaderFile();

@@ -184,6 +184,8 @@ void App::initVulkan() {
     createPresentSemaphores();
 
     if (!reloadShader(true)) throw std::runtime_error("initial shader compilation failed");
+
+    std::printf("[lab] F12 screenshots -> %s\n", screenshotDirectory().string().c_str());
 }
 
 void App::createDescriptorResources() {
@@ -536,23 +538,30 @@ void App::handleCapture() {
     }
 }
 
-// screenshots/<shader>/<shader>-<timestamp>.png inside the project, so captures
-// from different shaders never pile up in one directory. Nothing is drawn into
-// the frame to indicate a capture — the image is the deliverable, and an overlay
-// would end up baked into it.
-fs::path App::screenshotPath() const {
-    const std::string stem = shaderPath_.stem().string();
-
+// screenshots/<shader>/, created eagerly at startup rather than on the first
+// capture, so the destination is visible before you go looking for it.
+fs::path App::screenshotDirectory() const {
     // make_preferred: LAB_PROJECT_DIR arrives from CMake with forward slashes,
     // which would otherwise log as a mix of both separators on Windows.
-    fs::path directory = (fs::path(LAB_PROJECT_DIR) / "screenshots" / stem).make_preferred();
+    const fs::path directory =
+        (fs::path(LAB_PROJECT_DIR) / "screenshots" / shaderPath_.stem()).make_preferred();
+
     std::error_code ec;
     fs::create_directories(directory, ec);
     if (ec) {
         std::fprintf(stderr, "[lab] cannot create %s (%s); using the working directory\n",
                      directory.string().c_str(), ec.message().c_str());
-        directory = fs::current_path();
+        return fs::current_path();
     }
+    return directory;
+}
+
+// screenshots/<shader>/<shader>-<timestamp>.png, so captures from different
+// shaders never pile up together. Nothing is drawn into the frame to indicate a
+// capture — the image is the deliverable, and an overlay would be baked into it.
+fs::path App::screenshotPath() const {
+    const std::string stem = shaderPath_.stem().string();
+    const fs::path directory = screenshotDirectory();
 
     const std::time_t now = std::time(nullptr);
     const std::tm* local = std::localtime(&now);

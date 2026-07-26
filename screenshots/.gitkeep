@@ -1,0 +1,7 @@
+F12 captures land here, one directory per shader:
+
+    screenshots/mandelbrot/mandelbrot-20260725-213746.png
+
+The subdirectory is created when the app starts, named after the shader it was
+launched with. The images themselves are gitignored; this file only exists so
+the directory survives a clone.

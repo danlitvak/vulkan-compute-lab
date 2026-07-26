@@ -51,9 +51,9 @@ void imageBarrier(VkCommandBuffer cmd, VkImage image, VkPipelineStageFlags srcSt
 App::App(Options options) : options_(std::move(options)), shaderPath_(options_.shader) {
     // Seed both the target and the smoothed value, so a requested starting view
     // is already in place on frame zero instead of easing into it.
-    nav_.panX = nav_.smoothPanX = options_.panX;
-    nav_.panY = nav_.smoothPanY = options_.panY;
-    nav_.zoomExponent = nav_.smoothZoomExponent = std::log(std::max(options_.zoom, 1e-6));
+    nav_.centerX = nav_.smoothCenterX = options_.centerX;
+    nav_.centerY = nav_.smoothCenterY = options_.centerY;
+    nav_.scale = nav_.smoothScale = 1.0 / std::max(options_.zoom, 1e-9);
 }
 
 void App::run() {
@@ -91,8 +91,8 @@ void App::onKey(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_R) app->reloadRequested_ = true;
     if (key == GLFW_KEY_F12) app->screenshotRequested_ = true;
     if (key == GLFW_KEY_HOME) { // ease back to the default view
-        app->nav_.panX = app->nav_.panY = 0.0;
-        app->nav_.zoomExponent = 0.0;
+        app->nav_.centerX = app->nav_.centerY = 0.0;
+        app->nav_.scale = 1.0;
     }
 }
 
@@ -111,18 +111,31 @@ void App::onMouseButton(GLFWwindow* window, int button, int action, int) {
     }
 }
 
+// The deepest zoom at which fp32 shader coordinates still resolve individual
+// pixels. The shader computes p = centre + uv * scale, so adjacent pixels differ
+// by scale/height; once that step falls below the float32 ULP of p itself, the
+// whole neighbourhood collapses onto one representable coordinate.
+//
+//   step = scale / height        must exceed        ulp(p) ~= |p| * 2^-23
+//
+// |p| depends on the shader (the shipped ones stay within ~0.3 uv units of the
+// origin), which is why this is a default rather than a law: --max-zoom
+// overrides it, and a negative value removes the limit entirely.
+double App::minScale() const {
+    if (options_.maxZoom > 0.0) return 1.0 / options_.maxZoom;
+    if (options_.maxZoom < 0.0) return 0.0; // explicitly unlimited
+
+    const VkExtent2D extent = swapchain_.extent();
+    const double height = extent.height > 0 ? extent.height : 1.0;
+    constexpr double kCoordinateMagnitude = 0.3;
+    constexpr double kFloat32Ulp = 1.0 / 8388608.0; // 2^-23
+    return height * kCoordinateMagnitude * kFloat32Ulp;
+}
+
 void App::onScroll(GLFWwindow* window, double, double yOffset) {
     auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     Navigation& nav = app->nav_;
 
-    const double previousZoom = std::exp(nav.zoomExponent);
-    nav.zoomExponent += yOffset * 0.15;
-    const double zoom = std::exp(nav.zoomExponent);
-
-    // Zoom about the cursor rather than the window centre: solve for the pan
-    // that keeps the point currently under the pointer where it is.
-    //   shader maps uv -> (uv - pan) / zoom
-    //   so pan' = uv_cursor - (zoom' / zoom) * (uv_cursor - pan)
     const VkExtent2D extent = app->swapchain_.extent();
     if (extent.height == 0) return;
 
@@ -132,9 +145,32 @@ void App::onScroll(GLFWwindow* window, double, double yOffset) {
     const double uvX = (cursorX - 0.5 * extent.width) / height;
     const double uvY = (cursorY - 0.5 * height) / height;
 
-    const double ratio = zoom / previousZoom;
-    nav.panX = uvX - ratio * (uvX - nav.panX);
-    nav.panY = uvY - ratio * (uvY - nav.panY);
+    // Anchor on the *displayed* view, not the target. Both ends of the ease then
+    // satisfy centre == anchor - uv * scale for the same anchor, so the point
+    // under the cursor stays pinned on every intermediate frame.
+    const double anchorX = nav.smoothCenterX + uvX * nav.smoothScale;
+    const double anchorY = nav.smoothCenterY + uvY * nav.smoothScale;
+
+    // Compound from the target so fast scrolling accumulates.
+    double scale = nav.scale * std::exp(-yOffset * 0.15);
+
+    // Clamp before deriving the centre, or the anchor would be computed for a
+    // scale the view never reaches.
+    const double floorScale = app->minScale();
+    if (floorScale > 0.0 && scale < floorScale) {
+        scale = floorScale;
+        if (!app->zoomClampReported_) {
+            app->zoomClampReported_ = true;
+            std::printf("[lab] zoom limited to %.0fx: past this, fp32 shader coordinates "
+                        "quantize and the view snaps between lattice steps instead of "
+                        "moving. --max-zoom overrides, --max-zoom -1 removes the limit.\n",
+                        1.0 / floorScale);
+        }
+    }
+
+    nav.scale = scale;
+    nav.centerX = anchorX - uvX * scale;
+    nav.centerY = anchorY - uvY * scale;
 }
 
 void App::updateNavigation(float deltaTime) {
@@ -145,19 +181,23 @@ void App::updateNavigation(float deltaTime) {
     glfwGetCursorPos(window_, &cursorX, &cursorY);
 
     if (nav_.dragging) {
-        // Deltas, not absolute position. This is the whole trick.
-        nav_.panX += (cursorX - nav_.lastCursorX) / height;
-        nav_.panY += (cursorY - nav_.lastCursorY) / height;
+        // Deltas, not absolute position. Scaling by `scale` is what keeps a drag
+        // moving the image 1:1 with the cursor at every zoom level, and keeps the
+        // increment proportional to what a pixel is currently worth instead of
+        // shrinking into the noise floor as you zoom in.
+        nav_.centerX -= (cursorX - nav_.lastCursorX) / height * nav_.scale;
+        nav_.centerY -= (cursorY - nav_.lastCursorY) / height * nav_.scale;
     }
     nav_.lastCursorX = cursorX;
     nav_.lastCursorY = cursorY;
 
     // Frame-rate independent exponential smoothing, so the feel does not change
-    // with frame rate the way a plain per-frame lerp would.
+    // with frame rate the way a plain per-frame lerp would. Centre and scale
+    // must ease with the same factor — see the note on Navigation.
     const double alpha = 1.0 - std::exp(-18.0 * double(deltaTime));
-    nav_.smoothPanX += (nav_.panX - nav_.smoothPanX) * alpha;
-    nav_.smoothPanY += (nav_.panY - nav_.smoothPanY) * alpha;
-    nav_.smoothZoomExponent += (nav_.zoomExponent - nav_.smoothZoomExponent) * alpha;
+    nav_.smoothCenterX += (nav_.centerX - nav_.smoothCenterX) * alpha;
+    nav_.smoothCenterY += (nav_.centerY - nav_.smoothCenterY) * alpha;
+    nav_.smoothScale += (nav_.scale - nav_.smoothScale) * alpha;
 }
 
 // ---------------------------------------------------------------- vulkan ----
@@ -184,6 +224,16 @@ void App::initVulkan() {
     createPresentSemaphores();
 
     if (!reloadShader(true)) throw std::runtime_error("initial shader compilation failed");
+
+    // The starting view goes through the same ceiling as scrolling does; the
+    // swapchain has to exist first, since the limit depends on the height.
+    const double floorScale = minScale();
+    if (floorScale > 0.0 && nav_.scale < floorScale) {
+        std::printf("[lab] requested zoom %.0fx exceeds the fp32 limit, clamped to %.0fx "
+                    "(--max-zoom -1 to override)\n",
+                    1.0 / nav_.scale, 1.0 / floorScale);
+        nav_.scale = nav_.smoothScale = floorScale;
+    }
 
     std::printf("[lab] F12 screenshots -> %s\n", screenshotDirectory().string().c_str());
 }
@@ -437,9 +487,9 @@ bool App::drawFrame() {
     push.resolution[1] = static_cast<float>(extent.height);
     push.mouse[0] = extent.width > 0 ? static_cast<float>(nav_.lastCursorX / extent.width) : 0.0f;
     push.mouse[1] = extent.height > 0 ? static_cast<float>(nav_.lastCursorY / extent.height) : 0.0f;
-    push.pan[0] = static_cast<float>(nav_.smoothPanX);
-    push.pan[1] = static_cast<float>(nav_.smoothPanY);
-    push.zoom = static_cast<float>(std::exp(nav_.smoothZoomExponent));
+    push.center[0] = static_cast<float>(nav_.smoothCenterX);
+    push.center[1] = static_cast<float>(nav_.smoothCenterY);
+    push.zoom = static_cast<float>(1.0 / nav_.smoothScale);
     push.time = static_cast<float>(now - startTime_);
     push.deltaTime = deltaTime;
     push.frame = frameCounter_;

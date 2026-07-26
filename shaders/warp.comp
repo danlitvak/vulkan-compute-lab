@@ -11,7 +11,7 @@ layout(binding = 0, rgba8) uniform writeonly image2D target;
 layout(push_constant) uniform Push {
     vec2  resolution;
     vec2  mouse;      // normalised 0..1, y down
-    vec2  pan;        // drag offset, in units of screen height
+    vec2  center;     // view centre, in screen-height units at zoom 1
     float zoom;       // 1.0 at rest
     float time;
     float deltaTime;
@@ -60,10 +60,10 @@ void main() {
     ivec2 size  = ivec2(pc.resolution);
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
-    // Drag to pan, scroll to zoom. Pan comes from accumulated cursor deltas, so
-    // the field slides with the cursor instead of snapping when a drag starts.
+    // Drag to pan, scroll to zoom. The centre comes from accumulated cursor
+    // deltas, so the field slides with the cursor instead of snapping.
     vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
-    vec2 p  = (uv - pc.pan) / pc.zoom * 3.0;
+    vec2 p  = (pc.center + uv / pc.zoom) * 3.0;
 
     // Two rounds of domain warping: feed noise back into its own coordinates.
     vec2 q = vec2(fbm(p + 0.10 * pc.time),

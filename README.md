@@ -57,13 +57,13 @@ re-run the compile without touching the file.
 
 ```
 lab.exe [shader.comp] [--capture out.png] [--frames N] [--exit-after-capture]
-                      [--pan <x> <y>] [--zoom <z>]
+                      [--center <x> <y>] [--zoom <z>] [--max-zoom <z>]
 ```
 
 `--capture` is how the images in this README were made, and how the renderer gets
 verified without a human looking at a window.
 
-`--pan` and `--zoom` set the starting view, so a capture can be framed
+`--center` and `--zoom` set the starting view, so a capture can be framed
 reproducibly instead of dragged there by hand:
 
 ```powershell
@@ -81,7 +81,7 @@ is what makes a viewport feel broken:
 
 - **`mouse`** is the raw pointer, normalised, always live. It is only ever read,
   never re-anchored, so it cannot jump.
-- **`pan` and `zoom`** are navigation state, accumulated from cursor *deltas*.
+- **`center` and `zoom`** are navigation state, accumulated from cursor *deltas*.
   Pressing the button contributes exactly zero by construction, and on press the
   drag anchor is reset so the first frame of a drag cannot apply the distance the
   cursor travelled since the last drag ended.
@@ -94,9 +94,53 @@ re-anchor; relative values are safe to accumulate. That is the whole rule.
 Both are smoothed toward their targets with `1 - exp(-rate * dt)` rather than a
 plain per-frame lerp, so the feel does not change with frame rate.
 
-Zoom is applied about the cursor, not the window centre: the host solves for the
-pan that keeps the point under the pointer fixed, which is the difference between
-zooming *into what you are looking at* and having it slide out of frame.
+Zoom is applied about the cursor, not the window centre, which is the difference
+between zooming *into what you are looking at* and having it slide out of frame.
+
+### Why the view is stored as (centre, scale)
+
+Internally the state is the view centre and `scale = 1/zoom`, and **both ease
+with the same factor**. That pairing is not cosmetic — it is what makes zoom
+anchoring exact. The anchor condition
+
+```
+centre == anchor - uv_cursor * scale
+```
+
+is affine in `scale`, so if both endpoints of the ease satisfy it, so does every
+interpolated frame between them. The anchor is computed from the *displayed*
+view rather than the target, which is what puts the starting point on that line.
+
+The earlier version eased pan and log-zoom independently, and the anchor held
+only at the endpoints. Simulating one three-click scroll gesture, the point under
+the cursor drifted up to **6.9 pixels** mid-ease before settling back — the image
+lurching toward the mouse. Under the current scheme the same simulation drifts
+6e-14 pixels.
+
+### The zoom ceiling
+
+Zoom stops at a derived limit (**~38,800x** at 720p) because past it fp32 shader
+coordinates quantize. Adjacent pixels differ by `scale / height`; once that step
+drops below the float32 ULP of the coordinate itself, a whole neighbourhood
+collapses onto one representable value:
+
+```
+scale / height   >   |p| * 2^-23
+```
+
+Beyond the limit the picture goes blocky and — worse — the view can only move in
+whole lattice steps, so panning and zooming *snap* instead of sliding. Measured
+on the shipped Mandelbrot: 30,000x is clean, 100,000x is visibly stepped, and
+300,000x is coarse mush.
+
+The limit assumes the shader's coordinate stays within ~0.3 uv units of the
+origin, which holds for both shipped shaders. `--max-zoom <z>` overrides it and
+`--max-zoom -1` removes it, if you want to see the artifacts or your shader is
+conditioned differently.
+
+Going genuinely deeper is a precision problem, not a limit that can be tuned
+away: it needs fp64 coordinates (good to ~1e13, and roughly 1/32 rate on
+consumer NVIDIA) or perturbation theory against a high-precision reference orbit.
 
 ## Writing a shader
 
@@ -109,7 +153,7 @@ layout(binding = 0, rgba8) uniform writeonly image2D target;
 layout(push_constant) uniform Push {
     vec2  resolution;
     vec2  mouse;      // normalised 0..1, y down; always the live cursor
-    vec2  pan;        // accumulated drag, in units of screen height
+    vec2  center;     // view centre, in screen-height units at zoom 1
     float zoom;       // 1.0 at rest, larger as you scroll in
     float time;       // seconds since start
     float deltaTime;
@@ -117,16 +161,16 @@ layout(push_constant) uniform Push {
 } pc;
 ```
 
-To make a shader navigable, map pixels through `pan` and `zoom`:
+To make a shader navigable, map pixels through `center` and `zoom`:
 
 ```glsl
 vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
-vec2 p  = (uv - pc.pan) / pc.zoom;
+vec2 p  = pc.center + uv / pc.zoom;
 ```
 
-Applying `pan` before dividing by `zoom` is what makes a drag move the image 1:1
-with the cursor at any zoom level. Reverse the order and dragging gets slower as
-you zoom in.
+Offsetting *from* the centre rather than subtracting a growing pan is what keeps
+this well conditioned. `uv / zoom` shrinks as you zoom in, so the sum never has
+to represent a small difference between two large numbers.
 
 If the shader resolves more detail as it zooms — anything iterative — scale the
 work with `zoom`, or deep views quietly degrade. `mandelbrot.comp` does this:

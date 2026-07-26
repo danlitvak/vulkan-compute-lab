@@ -21,8 +21,10 @@ void printUsage() {
         "  --capture <file.png>    save a frame to file.png\n"
         "  --frames <n>            frames to render before capturing (default 60)\n"
         "  --exit-after-capture    quit once the capture is written\n"
-        "  --pan <x> <y>           starting pan, in units of screen height\n"
+        "  --center <x> <y>        starting view centre, in screen-height units\n"
         "  --zoom <z>              starting zoom (1.0 = default view)\n"
+        "  --max-zoom <z>          zoom ceiling; -1 removes it, default is derived\n"
+        "                          from the resolution (fp32 quantizes past it)\n"
         "  --help\n"
         "\n"
         "mouse: drag to pan, scroll to zoom (about the cursor)\n"
@@ -55,11 +57,13 @@ int main(int argc, char** argv) {
             options.captureAfterFrames = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--exit-after-capture") {
             options.exitAfterCapture = true;
-        } else if (arg == "--pan" && i + 2 < argc) {
-            options.panX = std::strtod(argv[++i], nullptr);
-            options.panY = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--center" && i + 2 < argc) {
+            options.centerX = std::strtod(argv[++i], nullptr);
+            options.centerY = std::strtod(argv[++i], nullptr);
         } else if (arg == "--zoom" && hasValue) {
             options.zoom = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--max-zoom" && hasValue) {
+            options.maxZoom = std::strtod(argv[++i], nullptr);
         } else if (!arg.empty() && arg.front() == '-') {
             std::fprintf(stderr, "[lab] unknown option: %s\n", arg.c_str());
             printUsage();

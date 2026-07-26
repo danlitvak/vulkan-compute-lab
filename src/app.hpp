@@ -20,9 +20,9 @@ namespace lab {
 // deltas, so pressing a button contributes exactly zero.
 struct PushConstants {
     float resolution[2];
-    float mouse[2]; // normalised 0..1, y down, always live
-    float pan[2];   // accumulated drag, in units of screen height
-    float zoom;     // 1.0 at rest, grows as you scroll in
+    float mouse[2];  // normalised 0..1, y down, always live
+    float center[2]; // view centre, in screen-height units at zoom 1
+    float zoom;      // 1.0 at rest, grows as you scroll in
     float time;
     float deltaTime;
     uint32_t frame;
@@ -37,9 +37,12 @@ struct Options {
     bool exitAfterCapture{false};
     // Starting view, so a capture can be framed reproducibly instead of having
     // to be dragged there by hand.
-    double panX{0.0};
-    double panY{0.0};
+    double centerX{0.0};
+    double centerY{0.0};
     double zoom{1.0};
+    // Deepest zoom allowed. 0 derives it from the framebuffer height; negative
+    // removes the limit and lets the view quantize.
+    double maxZoom{0.0};
 };
 
 class App {
@@ -95,14 +98,23 @@ private:
 
     // Drag-to-pan, scroll-to-zoom. Targets are what input writes; the smoothed
     // values are what the shader sees, so motion eases instead of snapping.
+    //
+    // The view is stored as (centre, scale) with scale == 1/zoom, and both are
+    // eased linearly with the same factor. That pairing is what makes zoom
+    // anchoring exact: the anchor condition centre == anchor - uv * scale is
+    // affine in scale, so any interpolation that moves both together preserves
+    // it at every intermediate frame, not just at the endpoints.
     struct Navigation {
-        double panX{0.0}, panY{0.0};
-        double smoothPanX{0.0}, smoothPanY{0.0};
-        double zoomExponent{0.0}; // zoom == exp(zoomExponent)
-        double smoothZoomExponent{0.0};
+        double centerX{0.0}, centerY{0.0};
+        double smoothCenterX{0.0}, smoothCenterY{0.0};
+        double scale{1.0}; // world units per unit of uv; zoom == 1/scale
+        double smoothScale{1.0};
         double lastCursorX{0.0}, lastCursorY{0.0};
         bool dragging{false};
     } nav_;
+
+    double minScale() const; // the deepest zoom fp32 coordinates still resolve
+    bool zoomClampReported_{false};
 
     Options options_;
     std::filesystem::path shaderPath_;

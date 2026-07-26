@@ -11,7 +11,7 @@ layout(binding = 0, rgba8) uniform writeonly image2D target;
 layout(push_constant) uniform Push {
     vec2  resolution;
     vec2  mouse;      // normalised 0..1, y down
-    vec2  pan;        // drag offset, in units of screen height
+    vec2  center;     // view centre, in screen-height units at zoom 1
     float zoom;       // 1.0 at rest
     float time;
     float deltaTime;
@@ -20,11 +20,14 @@ layout(push_constant) uniform Push {
 
 const float BAILOUT2 = 256.0; // squared escape radius
 
-// Drag to pan, scroll to zoom, Home to reset. The host accumulates pan from
-// cursor deltas, so this is continuous no matter when a drag starts or ends.
+// Drag to pan, scroll to zoom, Home to reset.
+//
+// Offsetting from the centre keeps this well conditioned: uv/zoom shrinks as you
+// zoom in, so the sum never has to represent a small difference between two
+// large numbers.
 vec2 viewCoord(ivec2 pixel) {
     vec2 uv = (vec2(pixel) - 0.5 * pc.resolution) / pc.resolution.y;
-    return (uv - pc.pan) / pc.zoom;
+    return pc.center + uv / pc.zoom;
 }
 
 // Iñigo Quílez cosine palette.

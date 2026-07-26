@@ -28,6 +28,16 @@ the CMake and Ninja that ship inside it — nothing needs to be on `PATH`.
 .\build.ps1 -Config Release -Run              # no validation layers
 ```
 
+Once it is built, launch the exe directly — faster, and it takes the flags below:
+
+```powershell
+.\build\Debug\lab.exe shaders\warp.comp
+```
+
+You do not rebuild to change a shader. Leave the window open, edit the `.comp`
+file, save, and it swaps the pipeline within a frame or two. `build.ps1` is only
+for C++ changes.
+
 | | |
 |---|---|
 | drag | pan |

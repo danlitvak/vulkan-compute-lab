@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -65,31 +66,69 @@ std::vector<uint32_t> readSpirv(const fs::path& path) {
     return words;
 }
 
+// Matches `name` against the directive opening `line` at `start`, returning a
+// pointer just past the name (so the caller can parse arguments) or nullptr.
+//
+// Two rules, both load-bearing:
+//   * the directive must OPEN the line, because prose that merely mentions one
+//     must not act as one — galaxy.comp's header both describes its `//!nbody`
+//     directive in English and carries `//!alias gravity grav nbody stars`, and
+//     neither line may be what switches the simulation path on;
+//   * the name must end at the match, or `//!camera3dish` would pass for
+//     `//!camera3d` and a typo would silently change modes instead of being
+//     ignored.
+const char* directiveArgument(const std::string& line, size_t start, const char* name) {
+    const size_t length = std::strlen(name);
+    if (line.compare(start, length, name) != 0) return nullptr;
+
+    const size_t after = start + length;
+    if (after < line.size()) {
+        const char next = line[after];
+        // \r is here for a file with mixed line endings: text-mode getline only
+        // strips the \r that came with a \n.
+        if (next != ' ' && next != '\t' && next != '\r') return nullptr;
+    }
+    return line.c_str() + after;
+}
+
 } // namespace
 
-uint32_t readParticleDirective(const fs::path& source) {
-    static constexpr const char* kDirective = "//!nbody";
-    static constexpr size_t kDirectiveLength = 8;
+ShaderDirectives readShaderDirectives(const fs::path& source) {
+    ShaderDirectives directives;
 
     std::ifstream file(source);
-    if (!file) return 0;
+    if (!file) return directives;
 
     std::string line;
     for (int scanned = 0; scanned < 40 && std::getline(file, line); ++scanned) {
-        // The directive must open the line. Matching anywhere would also hit a
-        // comment that merely mentions it, which is exactly what a shader
-        // documenting its own header does.
         const size_t start = line.find_first_not_of(" \t");
         if (start == std::string::npos) continue;
-        if (line.compare(start, kDirectiveLength, kDirective) != 0) continue;
 
-        const char* argument = line.c_str() + start + kDirectiveLength;
-        char* end = nullptr;
-        const unsigned long count = std::strtoul(argument, &end, 10);
-        if (end == argument || count == 0) continue; // no number: keep looking
-        return static_cast<uint32_t>(count);
+        if (const char* argument = directiveArgument(line, start, "//!nbody")) {
+            char* end = nullptr;
+            const unsigned long count = std::strtoul(argument, &end, 10);
+            // No number after the name: treat the line as prose and keep
+            // scanning, rather than failing the whole load over a half-typed
+            // directive in a file that is being edited live.
+            if (end != argument && count > 0 && directives.particleCount == 0)
+                directives.particleCount = static_cast<uint32_t>(count);
+            continue;
+        }
+        if (directiveArgument(line, start, "//!accumulate")) {
+            directives.accumulate = true;
+            continue;
+        }
+        if (directiveArgument(line, start, "//!camera3d")) {
+            directives.camera3d = true;
+            continue;
+        }
     }
-    return 0;
+
+    // Accumulation implies the fly camera: a path tracer is framed by a 3D view
+    // by construction, and there is no 2D pan/zoom that would mean anything to
+    // it. Folding it in here keeps every caller from having to remember.
+    if (directives.accumulate) directives.camera3d = true;
+    return directives;
 }
 
 CompileResult compileComputeShader(const fs::path& source, const std::vector<std::string>& defines) {

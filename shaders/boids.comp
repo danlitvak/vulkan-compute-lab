@@ -1,0 +1,600 @@
+#version 450
+
+// 3D flocking: 32768 agents running Reynolds' three rules against every other
+// agent, rendered as a light field you can fly into. The flock avoids the
+// camera, so pushing through the middle of it parts the swarm around you.
+//
+//!nbody 32768
+//!alias flock birds boids
+//
+// Why 32768 and not more. The neighbour search is the same exhaustive O(N^2)
+// sweep gravity uses. Measured here, Release, RTX 2080 SUPER at 1280x720:
+//
+//   32768 agents  (1.1e9 pairs/step)  ~95 fps
+//   65536 agents  (4.3e9 pairs/step)  ~42 fps
+//
+// Note that 4x the work costs only 2.3x the frame time, not 4x. The inner loop
+// culls on distance, and flocking is short-range: at equilibrium density only a
+// few percent of pairs fall inside the widest radius, so most of the quadratic
+// growth is skipped compares rather than real work. Gravity has no equivalent —
+// every pair matters there, which is why galaxy.comp scales almost perfectly
+// with N^2 and this does not.
+//
+// 32768 is chosen for the interaction, not the pixels: below roughly 45 fps the
+// camera-avoidance stops feeling like you are pushing through something alive,
+// which is the entire point of this shader. --particles 65536 still runs fine.
+//
+// One source, four passes. The host compiles this file once per pass with -D,
+// so a save reloads all of them together.
+//
+//   PASS_SEED       initial positions and a shared swirl, one per agent
+//   PASS_INTEGRATE  all-pairs neighbour search + steering, shared-memory tiled
+//   PASS_RENDER     perspective-project and splat weight + colour into accum
+//   PASS_TONEMAP    packed accumulator -> colour, and zero it for the next frame
+//
+// Every constant below is a plain `const`: edit, save, and the flock keeps
+// flying with the new values. That is the point of the tunables block — the
+// interesting states of a boid system live in narrow bands of the weights, and
+// finding them by restarting is hopeless.
+//
+// Drag to look, WASD to fly, Q/E down/up, shift to boost, scroll to trim
+// speed, Space to reseed, P to pause, Home to return to the default view.
+//
+// World is z-up, same as the galaxy, and the flock is centred on the origin.
+
+// ---------------------------------------------------------------- tunables --
+
+// Time. Fixed step, like galaxy.comp: real frame time is jittery enough that a
+// dt-driven flock visibly changes character when the frame rate dips, and a
+// steering system that is tuned at one dt is not tuned at another. The cost is
+// that the flock's wall-clock speed follows the frame rate, so a slower machine
+// runs the same flock in slow motion rather than a different flock badly.
+//
+// The step size is pinned to SEP_RADIUS rather than chosen by taste: at
+// SPEED_MAX an agent covers about a quarter of its personal space per step,
+// which is as coarse as separation tolerates. Much more than that
+// and separation is reacting to where a neighbour was two steps ago, which
+// shows up as agents visibly overshooting through each other.
+const float DT = 0.0050;  // simulated seconds per frame
+
+// Speed band, in world units per simulated second. The lower bound matters more
+// than it looks: boids allowed to reach zero speed collapse into static blobs,
+// because a stopped agent has no heading to align with and separation alone
+// cannot push it out of a crowd. Forcing everyone to keep flying is what makes
+// the flock churn instead of settling.
+const float SPEED_MIN = 0.34;
+const float SPEED_MAX = 0.95;
+
+// Steering ceiling for the three flocking rules combined. A boid is a point
+// with a turn rate, and this is the turn rate; without it a dense cluster can
+// hand one agent an enormous separation force and fling it out of frame.
+const float MAX_ACCEL = 4.5;   // world units / s^2
+
+// The three rules. Each has its own radius and weight, ordered
+// SEP < ALI < COH: push away from the crowd nearby, match heading at mid
+// range, drift toward the group at long range. Swapping that ordering (say
+// cohesion tighter than separation) gives a flock that fights itself and
+// buzzes in place — worth trying once to see why the ordering is not arbitrary.
+//
+// SEP_RADIUS is what sets the flock's size, because cohesion compresses the
+// swarm until separation refuses. 32768 agents at 0.020 spacing fill a sphere
+// of radius 0.40, comfortably inside the containment shell below — so
+// containment stays a backstop for strays instead of a wall the whole flock
+// leans on. Doubling this radius roughly doubles the flock's radius, and past
+// FLOCK_RADIUS the two forces start fighting and the flock breathes.
+//
+// At that spacing an agent has ~4 neighbours inside SEP_RADIUS, ~380 inside
+// ALI_RADIUS and ~1150 inside COH_RADIUS. The alignment count is why the flock
+// moves as a sheet rather than a crowd: each heading is an average over
+// hundreds of others, so noise cancels and only the collective turn survives.
+const float SEP_RADIUS   = 0.020;  // personal space
+const float SEP_STRENGTH = 5.0;    // scales the crowding vector, 1/s^2 per unit
+const float ALI_RADIUS   = 0.090;  // heading-matching neighbourhood
+const float ALI_GAIN     = 3.2;    // 1/s; velocity relaxes toward the local mean
+const float COH_RADIUS   = 0.130;  // group-finding neighbourhood
+const float COH_STIFF    = 7.0;    // 1/s^2 per unit of offset toward the centroid
+
+// Camera repulsion — the interactive part. The radius is deliberately wider
+// than the cohesion radius so the hole you make is bigger than a boid's own
+// notion of "my group", which is what makes the flock split and rejoin rather
+// than dent. Strong enough to be unmistakable, weak enough that the flock
+// closes back up behind you instead of being blasted to the containment shell.
+// It also works out at ~40% of the flock's own radius, so the wake is obvious
+// from outside rather than a dimple you have to hunt for.
+const float AVOID_RADIUS = 0.160;
+const float AVOID_ACCEL  = 8.0;    // world units / s^2 at zero distance
+
+// Soft containment. A one-sided spring outside FLOCK_RADIUS and nothing at all
+// inside it, so the interior stays unconstrained — a spring that pulls
+// everywhere piles the whole flock onto the origin.
+//
+// Deliberately not a wrapping box. Teleporting an agent across a boundary tears
+// the flock in two visually, and worse, it lies to the neighbour search: the
+// agent is suddenly surrounded by strangers while its actual flockmates are a
+// box-width away, so the seam permanently churns. A spring keeps the flock
+// findable without ever breaking the metric the rules are computed in.
+const float FLOCK_RADIUS  = 0.45;
+const float CONTAIN_STIFF = 45.0;  // 1/s^2 per unit of excursion
+
+// Seeding.
+const float SEED_RADIUS = 0.30;
+const float SEED_PATCH  = 0.075;  // headings are shared within a cell this big
+const float SEED_SWIRL  = 0.0;    // shared rotation about +z; see the note in SEED
+const float SEED_JITTER = 0.25;   // heading noise, as a fraction of SPEED_MAX
+
+// Rendering.
+const float SPLAT_SIGMA = 1.2;    // agent point-spread, in pixels
+const float NEAR_PLANE  = 0.004;  // ignore agents closer than this
+const float REF_DIST    = 0.50;   // distance at which an agent has unit weight
+// The clamp has to sit OUTSIDE the flock, not inside it. At REF_DIST 0.50 a cap
+// of 2.0 engages at z = 0.50/sqrt(2) = 0.35, which is inside the flock's own
+// ~0.45 radius — so during a fly-through, the regime this shader exists for,
+// every agent ahead of the camera would clamp to the same weight and the depth
+// cue would vanish exactly when it matters most.
+const float ATTEN_MAX   = 8.0;    // engages at z = REF_DIST/sqrt(8) = 0.18
+// Calibrated for the default view at 1280x720: the body of the flock lands near
+// mid-grey, leaving headroom above for the dense side and below for strays.
+// Both are resolution-dependent — twice the pixels is half the weight each —
+// so nudge EXPOSURE up when running at 4K.
+// Tuned for the isotropic 3D flock. The mill state this shader used to seed by
+// accident packed every agent into a thin disk, so screen density was several
+// times higher for the same agent count; a genuinely 3D flock spreads the same
+// 32768 agents through a volume and needs the exposure raised to match.
+const float EXPOSURE    = 0.55;   // brightness per unit of deposited weight
+const float LOG_RANGE   = 3.2;    // decades of screen density the ramp spans
+
+// 0 = colour by speed, 1 = colour by local neighbour density. Both are already
+// carried per agent, so this is a one-character edit and a save.
+const int   COLOUR_MODE  = 0;
+// A uniformly packed flock sums to ~260 of neighbour weight, so this reads
+// "typical" as most of the way up the ramp and reserves the top for clumps.
+const float DENSITY_REF  = 260.0; // neighbour weight that reads as fully dense
+
+const float TAU = 6.28318530718;
+
+// Fixed-point denominator for the atomic deposit, and the quantum of the
+// packing below. 64 puts the smallest visible deposit at 1/64 of an agent,
+// which keeps a distant flock from dissolving while leaving room for ~1000
+// units of weight in one pixel.
+const uint WEIGHT_SCALE = 64u;
+
+// Derived; GLSL folds these at compile time.
+const float SEP_R2 = SEP_RADIUS * SEP_RADIUS;
+const float ALI_R2 = ALI_RADIUS * ALI_RADIUS;
+const float COH_R2 = COH_RADIUS * COH_RADIUS;
+// Widest of the three, so the inner-loop cull stays correct whatever order the
+// radii above end up in after an edit.
+const float MAX_R2 = max(SEP_R2, max(ALI_R2, COH_R2));
+
+// ------------------------------------------------------------------ layout --
+
+// Same 32-byte stride the gravity simulation uses, so the host's buffers,
+// descriptors and ping-pong logic are reused untouched.
+//
+// posMass.w has no dynamical meaning here — a boid steers, it does not
+// gravitate — so it carries the agent's local neighbour weight instead, written
+// by INTEGRATE and read by RENDER. The slot exists either way; leaving it at a
+// constant would waste the one channel that can hand a per-agent scalar to the
+// renderer for free.
+struct Particle {
+    vec4 posMass;   // xyz position, w = local neighbour weight
+    vec4 vel;       // xyz velocity, w unused
+};
+
+layout(binding = 0, rgba8) uniform writeonly image2D target;
+layout(binding = 1, std430) buffer BufIn  { Particle bufIn[]; };
+layout(binding = 2, std430) buffer BufOut { Particle bufOut[]; };
+layout(binding = 3, r32ui) uniform coherent uimage2D accum;
+
+// A prefix of the host's push block, stopping at camForward: a simulation never
+// reads the accumulation-mode sampleIndex that follows it, and declaring only a
+// prefix is legal as long as every offset agrees.
+layout(push_constant) uniform Push {
+    vec2  resolution;
+    vec2  mouse;
+    vec2  center;
+    float zoom;
+    float time;
+    float deltaTime;
+    uint  frame;
+    uint  particleCount;
+    float fovScale;      // tan(fov / 2)
+    vec4  camPos;
+    vec4  camRight;
+    vec4  camUp;
+    vec4  camForward;
+} pc;
+
+// Normalise without producing NaNs for a zero vector. Every steering rule can
+// legitimately sum to exactly zero (a perfectly surrounded agent, a lone one),
+// and a single NaN velocity is permanent: it propagates through the neighbour
+// sums and takes the whole flock with it within a few frames.
+vec3 safeNormalize(vec3 v) {
+    float len2 = dot(v, v);
+    return len2 > 1e-20 ? v * inversesqrt(len2) : vec3(0.0);
+}
+
+// Smooth neighbour weighting, 1 at zero distance falling to exactly 0 at the
+// radius. Squared so the derivative also vanishes at the edge.
+//
+// This is not cosmetic. With a hard radius cutoff a neighbour's contribution
+// jumps between full and nothing as it crosses the boundary, and with hundreds
+// of neighbours crossing every frame the summed steering force flickers: the
+// flock pops and jitters, and dense groups buzz audibly in the motion. A
+// falloff that reaches zero smoothly makes a boundary crossing a non-event.
+//
+// Takes squared distance so the common case needs no square root.
+float falloff(float d2, float r2) {
+    float f = max(0.0, 1.0 - d2 / r2);
+    return f * f;
+}
+
+// ================================================================== SEED ====
+#ifdef PASS_SEED
+layout(local_size_x = 256) in;
+
+uint hashUint(uint x) {
+    x ^= x >> 16; x *= 0x7FEB352Du;
+    x ^= x >> 15; x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rnd(uint seed) {
+    return float(hashUint(seed * 0x9E3779B9u + 0x2545F491u)) / 4294967295.0;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.particleCount) return;
+
+    float u1 = rnd(i * 8u + 0u);
+    float u2 = rnd(i * 8u + 1u);
+    float u3 = rnd(i * 8u + 2u);
+    float u4 = rnd(i * 8u + 3u);
+    float u5 = rnd(i * 8u + 4u);
+    float u6 = rnd(i * 8u + 5u);
+
+    // Uniform direction on the sphere: z uniform in [-1,1] then a uniform
+    // azimuth. Picking three uniform components and normalising instead would
+    // bias toward the cube's corners.
+    float cz  = 2.0 * u1 - 1.0;
+    float phi = TAU * u2;
+    float s   = sqrt(max(0.0, 1.0 - cz * cz));
+    vec3 dir  = vec3(s * cos(phi), s * sin(phi), cz);
+
+    // Cube root of a uniform gives uniform density in the volume. Using u3
+    // directly would concentrate most of the flock near the centre, which then
+    // spends its first few seconds exploding outward under separation.
+    vec3 pos = dir * (SEED_RADIUS * pow(u3, 1.0 / 3.0));
+
+    // Locally coherent, globally isotropic. Agents sharing a coarse cell get the
+    // same heading, so the flock starts already organised into patches instead of
+    // as a gas of 32768 disagreeing directions -- but the patch directions are
+    // independent, so the system carries no net angular momentum.
+    //
+    // That distinction is the whole ballgame. Seeding one shared rotation about
+    // +z (what SEED_SWIRL does) hands the system global angular momentum, and
+    // none of the three rules can dissipate it: alignment *matches* headings, so
+    // it preserves net rotation rather than damping it. The flock centrifuges
+    // into a flat disk with a hollow centre and stays there forever -- a mill
+    // locked in at frame 0, which reads as a galaxy rather than a flock.
+    ivec3 cell = ivec3(floor(pos / SEED_PATCH));
+    uint cellHash = hashUint(uint(cell.x * 73856093 ^ cell.y * 19349663 ^ cell.z * 83492791));
+    float h1 = float(hashUint(cellHash + 0u)) / 4294967295.0;
+    float h2 = float(hashUint(cellHash + 1u)) / 4294967295.0;
+    float hz = 2.0 * h1 - 1.0;
+    float hs = sqrt(max(0.0, 1.0 - hz * hz));
+    vec3 heading = vec3(hs * cos(TAU * h2), hs * sin(TAU * h2), hz);
+
+    vec3 vel = heading * mix(SPEED_MIN, SPEED_MAX, 0.5);
+    vel += (vec3(u4, u5, u6) - 0.5) * (SPEED_MAX * SEED_JITTER);
+
+    // Optional global swirl, off by default. Raise it to lock in the mill state
+    // deliberately -- it is a real boids attractor and worth seeing on purpose,
+    // just not the default.
+    if (SEED_SWIRL > 0.0) {
+        vec3 tangent = safeNormalize(cross(vec3(0.0, 0.0, 1.0), pos));
+        if (tangent == vec3(0.0)) tangent = dir; // an agent exactly on the z axis
+        vel += tangent * SEED_SWIRL;
+    }
+
+    // Into the band immediately, so the very first frame already obeys the
+    // invariant the rest of the shader assumes.
+    float sp = max(length(vel), 1e-6);
+    vel *= clamp(sp, SPEED_MIN, SPEED_MAX) / sp;
+
+    Particle p;
+    p.posMass = vec4(pos, 0.0); // neighbour weight is unknown until INTEGRATE
+    p.vel     = vec4(vel, 0.0);
+
+    // Both buffers, so the first integrate step reads valid data whichever
+    // parity it happens to start on.
+    bufIn[i]  = p;
+    bufOut[i] = p;
+}
+#endif
+
+// ============================================================= INTEGRATE ====
+#ifdef PASS_INTEGRATE
+layout(local_size_x = 256) in;
+
+// One tile of neighbours staged in shared memory. Alignment needs velocities as
+// well as positions, so this is two arrays rather than gravity's one: 8 KiB per
+// workgroup, inside the 16 KiB of shared memory Vulkan guarantees. Without the
+// staging every invocation re-reads the entire agent buffer from global memory
+// and the kernel is bandwidth-bound long before it is compute-bound.
+shared vec4 tilePos[256];
+shared vec4 tileVel[256];
+
+// Padding lanes in the last tile are parked absurdly far away instead of being
+// masked with a branch. Gravity could give them mass 0 and let them cancel
+// themselves; boids cannot, because a padding agent left at the origin sits
+// *inside* the flock and would be treated as a real neighbour by every rule.
+// Parking them makes the ordinary distance cull discard them, which keeps the
+// inner loop free of a per-pair validity test.
+const vec3 PARK = vec3(1.0e6);
+
+void main() {
+    uint i     = gl_GlobalInvocationID.x;
+    uint local = gl_LocalInvocationID.x;
+    uint count = pc.particleCount;
+
+    // Out-of-range invocations still have to reach every barrier() below, so
+    // they run the loop against a parked position and return late. An early
+    // return here is not a wrong pixel, it is a barrier that some lanes never
+    // reach: a hang or undefined results, depending on the driver.
+    bool inRange = i < count;
+    vec3 p = inRange ? bufIn[i].posMass.xyz : PARK;
+    vec3 v = inRange ? bufIn[i].vel.xyz : vec3(0.0);
+
+    vec3  sepPush = vec3(0.0);   // summed unit vectors away from close neighbours
+    vec3  aliSum  = vec3(0.0);   // weighted neighbour velocity
+    float aliW    = 0.0;
+    vec3  cohSum  = vec3(0.0);   // weighted offset toward neighbours
+    float cohW    = 0.0;         // doubles as the local density measure
+
+    uint tiles = (count + 255u) / 256u;
+
+    for (uint t = 0u; t < tiles; ++t) {
+        uint src = t * 256u + local;
+        tilePos[local] = src < count ? bufIn[src].posMass : vec4(PARK, 0.0);
+        tileVel[local] = src < count ? bufIn[src].vel      : vec4(0.0);
+        barrier();
+
+        for (uint j = 0u; j < 256u; ++j) {
+            vec3  d  = tilePos[j].xyz - p;
+            float d2 = dot(d, d);
+
+            // The one branch in the inner loop, and it pays for itself many
+            // times over. Flocking is short-range: at the equilibrium density
+            // roughly 3.5% of pairs fall inside even the widest radius, so this
+            // compare skips the whole body 96 times out of 100 and the
+            // divergence it costs is nowhere near that. Gravity has no
+            // equivalent — every pair matters there, which is why galaxy.comp
+            // is branch-free and this is not.
+            // MAX_R2, not COH_R2. Culling at cohesion's radius is only correct
+            // while cohesion happens to be the widest of the three, and the
+            // header actively invites editing these radii — raising SEP_RADIUS or
+            // ALI_RADIUS past COH_RADIUS would silently truncate that rule with
+            // no error, which is the worst kind of hot-reload trap.
+            if (d2 > MAX_R2) continue;
+
+            // Self-interaction is left in deliberately. Separation is immune
+            // (d is the zero vector, so the direction term below vanishes),
+            // and for alignment and cohesion an agent counts itself as one
+            // neighbour among many, which dilutes both by 1/N and changes
+            // nothing visible. Testing j against i would cost every lane a
+            // compare to fix a rounding error.
+            float invD = inversesqrt(max(d2, 1e-12));
+
+            sepPush -= d * (invD * falloff(d2, SEP_R2));
+
+            float wa = falloff(d2, ALI_R2);
+            aliSum += tileVel[j].xyz * wa;
+            aliW   += wa;
+
+            float wc = falloff(d2, COH_R2);
+            cohSum += d * wc;
+            cohW   += wc;
+        }
+        barrier();
+    }
+
+    if (!inRange) return;
+
+    // --- steering ---------------------------------------------------------
+    vec3 steer = vec3(0.0);
+
+    // Separation. The accumulated vector already carries crowding in its
+    // magnitude — several close neighbours sum to a longer push than one — so
+    // it is used proportionally rather than normalised.
+    steer += sepPush * SEP_STRENGTH;
+
+    // Alignment: relax velocity toward the local mean heading. The mask is
+    // load-bearing. With no neighbours aliSum and aliW are both zero, and an
+    // unmasked (0 - v) * gain would tell an isolated agent to brake — exactly
+    // the wrong instruction for the one agent that needs to keep flying to
+    // find the flock again.
+    float aliActive = step(1e-9, aliW);
+    steer += (aliSum / max(aliW, 1e-9) - v) * (ALI_GAIN * aliActive);
+
+    // Cohesion: a spring toward the weighted neighbour centroid. Proportional,
+    // not normalised — a normalised pull applies full force even when the agent
+    // is already centred, which turns into a permanent chatter about the
+    // centroid instead of settling into it.
+    steer += (cohSum / max(cohW, 1e-9)) * COH_STIFF;
+
+    // The turn-rate ceiling applies to the flocking rules only.
+    float steerMag = length(steer);
+    if (steerMag > MAX_ACCEL) steer *= MAX_ACCEL / steerMag;
+
+    vec3 acc = steer;
+
+    // Camera avoidance, added after the clamp so the flock cannot decide it is
+    // too busy flocking to get out of the way. Bounded by AVOID_ACCEL by
+    // construction, so it needs no clamp of its own.
+    vec3 fromCam = p - pc.camPos.xyz;
+    float camD2 = dot(fromCam, fromCam);
+    acc += safeNormalize(fromCam) * (AVOID_ACCEL * falloff(camD2, AVOID_RADIUS * AVOID_RADIUS));
+
+    // Containment, likewise outside the clamp: it is the reason the flock is
+    // still on screen at all. Zero inside FLOCK_RADIUS, linear outside, and
+    // self-limiting because the excursion that produces it is bounded by the
+    // speed band.
+    float r = length(p);
+    float over = max(0.0, r - FLOCK_RADIUS);
+    acc -= safeNormalize(p) * (over * CONTAIN_STIFF);
+
+    // Semi-implicit Euler, same as the gravity path: velocity first, then
+    // position from the new velocity. Cheap, stable at this step size, and it
+    // does not inject the energy explicit Euler does.
+    v += acc * DT;
+
+    // Clamp into the speed band. Direction is preserved, so this limits how
+    // fast an agent flies without ever changing where it decided to go.
+    float sp = length(v);
+    // The fallback direction only matters for an agent that has arrived at
+    // exactly zero velocity, which the band itself makes unreachable after the
+    // first step; it exists so that case cannot produce a NaN.
+    vec3 dir = sp > 1e-6 ? v / sp : vec3(0.0, 0.0, 1.0);
+    v = dir * clamp(sp, SPEED_MIN, SPEED_MAX);
+
+    p += v * DT;
+
+    Particle result;
+    result.posMass = vec4(p, cohW); // neighbour weight rides along for RENDER
+    result.vel     = vec4(v, 0.0);
+    bufOut[i] = result;
+}
+#endif
+
+// ================================================================ RENDER ====
+#ifdef PASS_RENDER
+layout(local_size_x = 256) in;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.particleCount) return;
+
+    Particle agent = bufOut[i];
+
+    // World -> camera. The basis arrives orthonormal from the host, so this is a
+    // transpose-multiply rather than a full inverse.
+    vec3 rel = agent.posMass.xyz - pc.camPos.xyz;
+    float z = dot(rel, pc.camForward.xyz);
+    if (z < NEAR_PLANE) return; // behind the camera, or close enough to smear
+
+    float x = dot(rel, pc.camRight.xyz);
+    float y = dot(rel, pc.camUp.xyz);
+
+    // Perspective divide, expressed in half-screen-heights so the horizontal
+    // field of view widens with the aspect ratio instead of squashing.
+    vec2 ndc = vec2(x, y) / (z * pc.fovScale);
+    vec2 px = 0.5 * pc.resolution + vec2(ndc.x, -ndc.y) * (0.5 * pc.resolution.y);
+
+    // Inverse-square falloff, bounded. Unbounded 1/z^2 blows out to a white
+    // screen the moment the camera clips an agent — and since flying into the
+    // flock is the entire interaction here, that happens constantly rather
+    // than by accident. The cap is also half of the packing budget below.
+    float attenuation = min((REF_DIST * REF_DIST) / (z * z), ATTEN_MAX);
+
+    // What the pixel is coloured by, normalised to 0..1.
+    //
+    // Speed is free: it is already clamped to [SPEED_MIN, SPEED_MAX], so the
+    // band that exists to stop agents stalling doubles as the colour range with
+    // no extra tunable. It also happens to be the most legible readout of
+    // flock structure in motion — the outside of a turn runs fast and the
+    // inside runs slow, so a banking flock stripes itself.
+    float speedKey = clamp((length(agent.vel.xyz) - SPEED_MIN) / (SPEED_MAX - SPEED_MIN), 0.0, 1.0);
+    float densityKey = clamp(agent.posMass.w / DENSITY_REF, 0.0, 1.0);
+    float key = COLOUR_MODE == 0 ? speedKey : densityKey;
+
+    // Splat over a small kernel rather than one pixel, so the flock reads as a
+    // continuous body of light instead of scattered dots.
+    ivec2 base = ivec2(floor(px));
+    float inv2Sigma2 = 1.0 / (2.0 * SPLAT_SIGMA * SPLAT_SIGMA);
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            ivec2 c = base + ivec2(dx, dy);
+            if (c.x < 0 || c.y < 0 || c.x >= int(pc.resolution.x) || c.y >= int(pc.resolution.y))
+                continue;
+
+            // Offset from the true sub-pixel position, so the splat does not
+            // jitter as the agent crosses a pixel boundary.
+            vec2 delta = (vec2(c) + 0.5) - px;
+            float w = exp(-dot(delta, delta) * inv2Sigma2) * attenuation;
+
+            // Two quantities have to survive one 32-bit atomic: how much light
+            // landed here, and what colour it was. They are packed into halves
+            // of the same word — weight in the high 16 bits, weight*key in the
+            // low 16 — and TONEMAP recovers the weighted mean key by dividing.
+            //
+            // The packing is safe because key <= 1 makes the low field no
+            // larger than the high one, per deposit and therefore per sum: the
+            // low half cannot carry into the high half unless the high half has
+            // already overflowed. That takes 65535/WEIGHT_SCALE = 1024 units of
+            // weight in a single pixel, which at ATTEN_MAX = 2 means ~512
+            // agents on one pixel. Raising ATTEN_MAX or WEIGHT_SCALE spends
+            // that headroom; both budgets move together.
+            uint wq = min(uint(w * float(WEIGHT_SCALE)), 0xFFFFu);
+            if (wq == 0u) continue;
+            uint cq = uint(float(wq) * key); // truncation only ever reduces it
+            imageAtomicAdd(accum, c, (wq << 16) | cq);
+        }
+    }
+}
+#endif
+
+// =============================================================== TONEMAP ====
+#ifdef PASS_TONEMAP
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Cold blue where agents are slow (or sparse), through teal and amber, to hot
+// white where they are fast (or packed). Monotone in luminance as well as hue,
+// so the ramp still reads correctly in a greyscale screenshot.
+vec3 palette(float t) {
+    const vec3 cold = vec3(0.060, 0.130, 0.420);
+    const vec3 cool = vec3(0.100, 0.520, 0.700);
+    const vec3 warm = vec3(0.950, 0.640, 0.240);
+    const vec3 hot  = vec3(1.000, 0.960, 0.900);
+    vec3 c = mix(cold, cool, smoothstep(0.00, 0.40, t));
+    c = mix(c, warm, smoothstep(0.40, 0.78, t));
+    c = mix(c, hot, smoothstep(0.78, 1.00, t));
+    return c;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.resolution.x) || px.y >= int(pc.resolution.y)) return;
+
+    uint raw = imageLoad(accum, px).x;
+
+    // Zeroed here rather than in a separate clear pass: exactly one invocation
+    // touches each pixel, so this is race-free and saves a full-screen dispatch.
+    imageStore(accum, px, uvec4(0u));
+
+    float weight = float(raw >> 16) / float(WEIGHT_SCALE);
+    float keySum = float(raw & 0xFFFFu) / float(WEIGHT_SCALE);
+
+    // Weighted mean of the colour key over everything that landed here. Nearer
+    // and brighter agents dominate, which is what you want: the colour follows
+    // whatever is most visible in the pixel rather than the last writer.
+    float key = keySum / max(weight, 1e-6);
+
+    // Screen density spans orders of magnitude between the near edge of the
+    // flock and its far side, so compress it logarithmically. Linear leaves the
+    // near agents blown out and the far ones invisible at the same time.
+    float b = clamp(log2(1.0 + weight * EXPOSURE * 64.0) / LOG_RANGE, 0.0, 1.0);
+
+    vec3 col = palette(clamp(key, 0.0, 1.0)) * b;
+
+    // Push the very densest pixels toward white. Without it a tight cluster
+    // saturates to whatever hue it happens to have and stops reading as
+    // "denser than everything around it".
+    col = mix(col, vec3(1.0), smoothstep(0.82, 1.0, b) * 0.55);
+
+    imageStore(target, px, vec4(col, 1.0));
+}
+#endif

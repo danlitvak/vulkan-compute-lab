@@ -29,13 +29,22 @@ void printUsage() {
         "\n"
         "  --particles <n>         override a simulation shader's //!nbody count\n"
         "\n"
-        "pixel shaders: drag to pan, scroll to zoom (about the cursor)\n"
-        "simulations:   drag to look, WASD to fly, Q/E down/up,\n"
-        "               shift boost, ctrl crawl, scroll trims fly speed\n"
+        "a shader picks its own mode with a directive in its first 40 lines:\n"
+        "  //!nbody <count>        GPU N-body simulation, 3D camera\n"
+        "  //!accumulate           progressive sampling (path tracer), 3D camera\n"
+        "  //!camera3d             3D camera for an otherwise plain shader\n"
+        "\n"
+        "2D shaders:   drag to pan, scroll to zoom (about the cursor)\n"
+        "3D shaders:   drag to look, WASD to fly, Q/E down/up,\n"
+        "              shift boost, ctrl crawl, scroll trims fly speed\n"
         "keys:  R reload shader, Home reset view, Esc quit\n"
-        "       Space reseed simulation, P pause simulation\n"
+        "       Space reseed simulation / restart accumulation, P pause simulation\n"
         "       F12 screenshot -> screenshots/<shader>/<shader>-<timestamp>.png\n"
-        "the shader also reloads on its own whenever the file changes on disk\n");
+        "the shader also reloads on its own whenever the file changes on disk\n"
+        "\n"
+        "accumulating shaders restart whenever the camera moves, the window is\n"
+        "resized, or the shader reloads; --capture --frames <n> therefore writes\n"
+        "the image as it stood after n samples\n");
 }
 
 } // namespace

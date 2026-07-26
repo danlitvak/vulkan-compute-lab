@@ -93,7 +93,7 @@ bool Simulation::create(Context& ctx, const fs::path& shader, uint32_t particleC
 
     VkPushConstantRange range{};
     range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    range.size = sizeof(SimPushConstants);
+    range.size = sizeof(PushConstants);
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pipelineLayoutInfo.setLayoutCount = 1;
@@ -336,7 +336,7 @@ bool Simulation::resize(Context& ctx, const std::vector<VkImageView>& targetView
     return true;
 }
 
-void Simulation::record(VkCommandBuffer cmd, uint32_t frameSlot, const SimPushConstants& push) {
+void Simulation::record(VkCommandBuffer cmd, uint32_t frameSlot, const PushConstants& push) {
     const VkDescriptorSet set = descriptors_[frameSlot * 2 + parity_];
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &set, 0,
                             nullptr);

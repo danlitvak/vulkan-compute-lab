@@ -31,6 +31,7 @@ add_executable(lab
   src/shader_compiler.cpp
   src/png.cpp
   src/simulation.cpp
+  src/accumulator.cpp
   src/app.cpp
 )
 

@@ -1,44 +1,20 @@
 #pragma once
 
 #include "context.hpp"
+#include "push_constants.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
 
 namespace lab {
 
-struct PushConstants;
-
-// Push block for simulation shaders: the standard fields, the particle count,
-// and a 3D camera. Physics constants deliberately live in the shader as `const`s
-// so they reload with it — the host only owns what determines buffer sizes.
-//
-// The camera basis is sent as vec4 rather than vec3 on purpose. std430 gives a
-// vec3 16-byte alignment *and* 16 bytes of stride anyway, so writing vec3 here
-// would silently pad and desynchronise the two structs. Using vec4 makes the
-// padding explicit and keeps every member on an offset both sides agree on.
-struct SimPushConstants {
-    float resolution[2]; // 0
-    float mouse[2];      // 8
-    float center[2];     // 16
-    float zoom;          // 24
-    float time;          // 28
-    float deltaTime;     // 32
-    uint32_t frame;      // 36
-    uint32_t particleCount; // 40
-    float fovScale;      // 44  tan(fov/2)
-    float camPos[4];     // 48  xyz + pad, 16-byte aligned
-    float camRight[4];   // 64
-    float camUp[4];      // 80
-    float camForward[4]; // 96
-};                       // 112, inside the 128-byte guaranteed minimum
-
-static_assert(sizeof(SimPushConstants) == 112, "shader Push block must match this layout");
-static_assert(offsetof(SimPushConstants, camPos) == 48, "camera basis must stay 16-byte aligned");
-
 // An N-body particle simulation running entirely on the GPU.
+//
+// The push block is the shared PushConstants: a simulation shader declares the
+// prefix up to `camForward` and ignores the rest. Physics constants deliberately
+// live in the shader as `const`s so they reload with it — the host only owns
+// what determines buffer sizes.
 //
 // Four passes compiled from one source file with -D:
 //   SEED       one invocation per particle, writes initial conditions
@@ -59,10 +35,11 @@ public:
     // Rebuilds only the pipelines, keeping particle state across a shader edit.
     bool reloadPipelines(Context& ctx, const std::filesystem::path& shader);
 
-    // Swapchain resize: the accumulation images follow the framebuffer.
+    // Swapchain resize: the per-pixel count images follow the framebuffer. (These
+    // are the splat counts of the RENDER pass, unrelated to //!accumulate mode.)
     bool resize(Context& ctx, const std::vector<VkImageView>& targetViews, VkExtent2D extent);
 
-    void record(VkCommandBuffer cmd, uint32_t frameSlot, const SimPushConstants& push);
+    void record(VkCommandBuffer cmd, uint32_t frameSlot, const PushConstants& push);
 
     void requestSeed() { seedPending_ = true; }
     void setPaused(bool paused) { paused_ = paused; }

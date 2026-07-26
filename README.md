@@ -272,6 +272,57 @@ thickness that would otherwise help stabilise it. There is no gas and therefore
 no dissipation, which is why spiral arms here are transient — they heat the disk
 and fade, exactly as they do in pure N-body disk models.
 
+## Progressive path tracing
+
+A shader declaring `//!accumulate` renders one sample per frame into a persistent
+`RGBA32F` buffer and displays the running mean, so the image converges the longer
+you leave it alone. `pathtrace.comp` is a small analytic scene — a checkerboard
+plane, diffuse and metal spheres, an emissive light, a sky gradient — with
+cosine-weighted diffuse bounces and Russian-roulette termination.
+
+```powershell
+.\run pt
+```
+
+Measured at **~310 samples/sec** at 1280x720 (Release, RTX 2080 SUPER), so it is
+visually clean in a couple of seconds. Fly with the same controls as the
+simulations; the accumulator resets whenever the camera moves, the window
+resizes, or the shader reloads, and `Space` restarts it by hand.
+
+Accumulation runs with **one frame in flight**. Two frames read-modify-writing a
+single shared image is a race that no barrier inside one command buffer can fix,
+because barriers do not order across submissions.
+
+`--capture --frames N` writes the image as it stood after N samples, which is how
+the picture above was made.
+
+## Flocking
+
+`boids.comp` is 32768 agents on the same four-pass simulation path as the galaxy —
+separation, alignment and cohesion with smooth distance falloff, exhaustive
+O(N²) neighbour search, shared-memory tiled.
+
+```powershell
+.\run flock
+```
+
+**The boids avoid the camera**, so flying into the flock parts it around you
+rather than through you. That is the point of the exercise.
+
+Two things worth knowing, both learned the hard way:
+
+- **Seed headings locally coherent but globally isotropic.** Agents sharing a
+  coarse cell start with the same heading, so the flock is organised in patches
+  from frame one instead of being a gas. What you must *not* do is seed a shared
+  rotation: none of the three rules can dissipate net angular momentum —
+  alignment *matches* headings, so it preserves rotation rather than damping it —
+  and the flock centrifuges into a flat disk with a hollow centre and stays
+  there. `SEED_SWIRL` still exists, defaulting to 0, because that mill state is a
+  real boids attractor and worth seeing deliberately.
+- **4× the agents costs only 2.3× the frame time** (95 fps at 32k, 42 fps at
+  65k), because the inner loop culls on distance and flocking is short-range.
+  Gravity has no equivalent and scales almost perfectly with N².
+
 ## Writing a shader
 
 Copy `shaders/mandelbrot.comp` and change the body — `.\run` picks up new files

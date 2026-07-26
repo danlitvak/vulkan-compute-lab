@@ -1,6 +1,8 @@
 #pragma once
 
+#include "accumulator.hpp"
 #include "context.hpp"
+#include "push_constants.hpp"
 #include "simulation.hpp"
 #include "swapchain.hpp"
 
@@ -12,25 +14,6 @@
 struct GLFWwindow;
 
 namespace lab {
-
-// Mirrored by the `Push` block in every .comp shader. Keep the two in sync:
-// std430 push-constant rules put these at the same offsets as the C++ struct.
-//
-// `mouse` is the raw pointer and `pan`/`zoom` are navigation state. Keeping them
-// separate is what stops a click from jumping the image: absolute values are
-// only ever read, never re-anchored, and navigation only ever accumulates
-// deltas, so pressing a button contributes exactly zero.
-struct PushConstants {
-    float resolution[2];
-    float mouse[2];  // normalised 0..1, y down, always live
-    float center[2]; // view centre, in screen-height units at zoom 1
-    float zoom;      // 1.0 at rest, grows as you scroll in
-    float time;
-    float deltaTime;
-    uint32_t frame;
-};
-
-static_assert(sizeof(PushConstants) == 40, "shader Push block must match this layout");
 
 struct Options {
     std::filesystem::path shader;
@@ -55,7 +38,9 @@ public:
     void run();
 
 private:
-    static constexpr uint32_t kFramesInFlight = 2;
+    // Slots are always allocated; how many of them the loop actually cycles
+    // through is framesInFlight_, because accumulation has to run with one.
+    static constexpr uint32_t kMaxFramesInFlight = 2;
 
     // One storage image per frame in flight. Sharing a single target would let
     // frame N's dispatch overwrite frame N-1's pixels while they are still
@@ -81,7 +66,11 @@ private:
 
     bool reloadShader(bool initial);
     bool reloadSimulation(uint32_t particleCount, bool initial);
+    bool reloadAccumulator(bool initial);
     void destroyPipeline();
+    void discardSimulation();
+    void discardAccumulator();
+    void setFramesInFlight(uint32_t count);
     std::vector<VkImageView> targetViews() const;
 
     void mainLoop();
@@ -122,8 +111,9 @@ private:
     double minScale() const; // the deepest zoom fp32 coordinates still resolve
     bool zoomClampReported_{false};
 
-    // Free-fly camera, used whenever a simulation is running. Pixel shaders keep
-    // the 2D centre/zoom navigation above; the two never apply at once.
+    // Free-fly camera, used whenever the shader asked for a 3D view (//!camera3d,
+    // //!nbody, //!accumulate). 2D pixel shaders keep the centre/zoom navigation
+    // above; the two never apply at once — see cameraMode_.
     //
     // World is z-up with the galactic disk in the xy plane, which is the usual
     // convention for a disk galaxy and makes "height above the disk" just z.
@@ -139,6 +129,21 @@ private:
     void cameraBasis(float right[3], float up[3], float forward[3]) const;
     void resetCamera();
 
+    // The view a sample was traced with, as the exact float32 values the shader
+    // received rather than the doubles behind them. That is the honest test for
+    // "did the camera move": a change too small to alter the push constants
+    // cannot alter the image either, so it must not throw the sum away.
+    struct AccumView {
+        float fovScale{};
+        float camPos[4]{};
+        float camRight[4]{};
+        float camUp[4]{};
+        float camForward[4]{};
+        bool operator==(const AccumView&) const = default;
+    };
+    static AccumView accumViewOf(const PushConstants& push);
+    AccumView lastAccumView_{};
+
     Options options_;
     std::filesystem::path shaderPath_;
     std::filesystem::file_time_type shaderWriteTime_{};
@@ -152,13 +157,20 @@ private:
     VkPipeline pipeline_{};
     VkDescriptorPool descriptorPool_{};
 
-    // Non-null only when the shader declares //!nbody. In that mode the
-    // single-pass pipeline above is unused and the simulation records the frame.
-    std::unique_ptr<Simulation> sim_;
+    // At most one of these is ever non-null, chosen by the shader's directives.
+    // When either is live the single-pass pipeline above is unused and that
+    // object records the frame instead.
+    std::unique_ptr<Simulation> sim_;   // //!nbody
+    std::unique_ptr<Accumulator> accum_; // //!accumulate
+
+    // //!camera3d, or implied by //!nbody or //!accumulate. Routes input to the
+    // fly camera; otherwise the 2D pan/zoom above applies. Never both at once.
+    bool cameraMode_{false};
 
     std::vector<Frame> frames_;
     std::vector<VkSemaphore> presentReady_; // one per swapchain image
 
+    uint32_t framesInFlight_{kMaxFramesInFlight};
     uint32_t frameIndex_{0};
     uint32_t frameCounter_{0};
     bool framebufferResized_{false};

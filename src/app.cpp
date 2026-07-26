@@ -95,8 +95,13 @@ void App::onKey(GLFWwindow* window, int key, int, int action, int) {
         if (key == GLFW_KEY_SPACE) app->sim_->requestSeed();
         if (key == GLFW_KEY_P) app->sim_->setPaused(!app->sim_->paused());
     }
+    // Space means "start over" in both modes: reseed the particles, or throw away
+    // the accumulated samples and re-converge from the current view. Useful on
+    // its own for a shader whose sampling changed with `time` rather than with
+    // the camera, which nothing else here can detect.
+    if (app->accum_ && key == GLFW_KEY_SPACE) app->accum_->requestReset();
     if (key == GLFW_KEY_HOME) { // ease back to the default view
-        if (app->sim_) {
+        if (app->cameraMode_) {
             app->resetCamera();
         } else {
             app->nav_.centerX = app->nav_.centerY = 0.0;
@@ -144,10 +149,10 @@ double App::minScale() const {
 void App::onScroll(GLFWwindow* window, double, double yOffset) {
     auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
 
-    // In a simulation the wheel trims fly speed rather than zooming: with a
-    // perspective camera you close distance by flying, and a separate zoom would
-    // just be a second, confusing way to change apparent scale.
-    if (app->sim_) {
+    // With a 3D camera the wheel trims fly speed rather than zooming: you close
+    // distance by flying, and a separate zoom would just be a second, confusing
+    // way to change apparent scale.
+    if (app->cameraMode_) {
         app->camera_.speed = std::clamp(app->camera_.speed * std::exp(yOffset * 0.2), 0.004, 20.0);
         return;
     }
@@ -193,6 +198,19 @@ void App::onScroll(GLFWwindow* window, double, double yOffset) {
 
 void App::resetCamera() {
     camera_ = Camera{};
+}
+
+// Pulled straight out of the push block rather than recomputed from camera_, so
+// what is compared is byte-for-byte what the shader was given. Anything the
+// shader cannot see must not be able to invalidate the accumulated sum.
+App::AccumView App::accumViewOf(const PushConstants& push) {
+    AccumView view;
+    view.fovScale = push.fovScale;
+    std::memcpy(view.camPos, push.camPos, sizeof(view.camPos));
+    std::memcpy(view.camRight, push.camRight, sizeof(view.camRight));
+    std::memcpy(view.camUp, push.camUp, sizeof(view.camUp));
+    std::memcpy(view.camForward, push.camForward, sizeof(view.camForward));
+    return view;
 }
 
 // Right-handed basis from yaw/pitch, with world +z as up.
@@ -276,6 +294,20 @@ void App::updateCamera(float deltaTime) {
     camera_.velX += (desiredX - camera_.velX) * alpha;
     camera_.velY += (desiredY - camera_.velY) * alpha;
     camera_.velZ += (desiredZ - camera_.velZ) * alpha;
+
+    // Come to an exact stop once nothing is held and the eased velocity is
+    // negligible. Exponential decay never actually reaches zero, so without this
+    // the camera creeps by a vanishing amount every frame forever — invisible on
+    // screen, but accumulation compares the camera against the one the last
+    // sample was traced with and would throw the image away on every frame. The
+    // cut-off is four orders of magnitude below fly speed, so the snap itself
+    // cannot move the view by a fraction of a pixel.
+    if (length <= 1e-9) {
+        const double stopped = camera_.speed * 1e-4;
+        if (std::abs(camera_.velX) < stopped && std::abs(camera_.velY) < stopped &&
+            std::abs(camera_.velZ) < stopped)
+            camera_.velX = camera_.velY = camera_.velZ = 0.0;
+    }
 
     camera_.x += camera_.velX * deltaTime;
     camera_.y += camera_.velY * deltaTime;
@@ -371,37 +403,40 @@ void App::createDescriptorResources() {
     pipelineLayoutInfo.pPushConstantRanges = &range;
     VK_CHECK(vkCreatePipelineLayout(ctx_.device(), &pipelineLayoutInfo, nullptr, &pipelineLayout_));
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight};
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = kFramesInFlight;
+    poolInfo.maxSets = kMaxFramesInFlight;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     VK_CHECK(vkCreateDescriptorPool(ctx_.device(), &poolInfo, nullptr, &descriptorPool_));
 }
 
 void App::createFrames() {
-    frames_.resize(kFramesInFlight);
+    // Every slot is built up front even though accumulation only ever uses the
+    // first. Two command buffers, fences and images are cheap, and it means the
+    // frame count can change on a shader reload without touching any of this.
+    frames_.resize(kMaxFramesInFlight);
 
-    std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, setLayout_);
+    std::vector<VkDescriptorSetLayout> layouts(kMaxFramesInFlight, setLayout_);
     VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = descriptorPool_;
-    allocInfo.descriptorSetCount = kFramesInFlight;
+    allocInfo.descriptorSetCount = kMaxFramesInFlight;
     allocInfo.pSetLayouts = layouts.data();
-    std::vector<VkDescriptorSet> sets(kFramesInFlight);
+    std::vector<VkDescriptorSet> sets(kMaxFramesInFlight);
     VK_CHECK(vkAllocateDescriptorSets(ctx_.device(), &allocInfo, sets.data()));
 
     VkCommandBufferAllocateInfo cmdInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cmdInfo.commandPool = ctx_.commandPool();
     cmdInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdInfo.commandBufferCount = kFramesInFlight;
-    std::vector<VkCommandBuffer> buffers(kFramesInFlight);
+    cmdInfo.commandBufferCount = kMaxFramesInFlight;
+    std::vector<VkCommandBuffer> buffers(kMaxFramesInFlight);
     VK_CHECK(vkAllocateCommandBuffers(ctx_.device(), &cmdInfo, buffers.data()));
 
     VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // so the first wait returns immediately
 
-    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         frames_[i].descriptor = sets[i];
         frames_[i].cmd = buffers[i];
         VK_CHECK(vkCreateSemaphore(ctx_.device(), &semaphoreInfo, nullptr, &frames_[i].imageAvailable));
@@ -519,24 +554,90 @@ bool App::reloadSimulation(uint32_t particleCount, bool initial) {
     return true;
 }
 
+// A shader declaring //!accumulate keeps a running sum across frames. Editing it
+// rebuilds the pipeline and resets the sum, because samples traced by the old
+// code cannot be averaged with samples traced by the new one.
+bool App::reloadAccumulator(bool initial) {
+    if (accum_) return accum_->reloadPipeline(ctx_, shaderPath_);
+
+    auto rebuilt = std::make_unique<Accumulator>();
+    if (!rebuilt->create(ctx_, shaderPath_, targetViews(), swapchain_.extent())) {
+        rebuilt->destroy(ctx_);
+        if (!initial) std::fprintf(stderr, "[lab] keeping the previous pipeline\n");
+        return false;
+    }
+    accum_ = std::move(rebuilt);
+    std::printf("[lab] accumulating: one sample per frame, Space restarts\n");
+    return true;
+}
+
+void App::discardSimulation() {
+    if (!sim_) return;
+    vkDeviceWaitIdle(ctx_.device()); // its pipelines may still be in flight
+    sim_->destroy(ctx_);
+    sim_.reset();
+}
+
+void App::discardAccumulator() {
+    if (!accum_) return;
+    vkDeviceWaitIdle(ctx_.device());
+    accum_->destroy(ctx_);
+    accum_.reset();
+}
+
+// Accumulation must run with a single frame in flight: two frames both
+// read-modify-writing the one shared sum have no ordering between them, since
+// the second is recorded and submitted before the first has finished, so its
+// sample count is stale and its imageLoad may or may not see the other's store.
+// Draining first is what makes dropping a slot safe — its command buffer may
+// still be executing, and nothing will ever wait on its fence again.
+void App::setFramesInFlight(uint32_t count) {
+    if (count == framesInFlight_) return;
+    vkDeviceWaitIdle(ctx_.device());
+    framesInFlight_ = count;
+    frameIndex_ = 0;
+}
+
 bool App::reloadShader(bool initial) {
-    if (const uint32_t declared = readParticleDirective(shaderPath_); declared > 0) {
-        const uint32_t count = options_.particleCount > 0 ? options_.particleCount : declared;
-        if (!reloadSimulation(count, initial)) return false;
-        std::error_code simEc;
-        shaderWriteTime_ = fs::last_write_time(shaderPath_, simEc);
+    const ShaderDirectives directives = readShaderDirectives(shaderPath_);
+
+    // A simulation is framed by a 3D view too, and readShaderDirectives already
+    // folds //!accumulate into camera3d. Applied only once a mode has been built
+    // successfully: a failed reload keeps the previous pipeline running, and the
+    // input routing has to keep matching whatever is actually on screen.
+    const bool wantsCamera = directives.camera3d || directives.particleCount > 0;
+
+    const auto noteLoaded = [&] {
+        std::error_code ec;
+        shaderWriteTime_ = fs::last_write_time(shaderPath_, ec);
         std::printf("[lab] %s %s\n", initial ? "loaded" : "reloaded",
                     shaderPath_.filename().string().c_str());
+    };
+
+    if (directives.particleCount > 0) {
+        const uint32_t count =
+            options_.particleCount > 0 ? options_.particleCount : directives.particleCount;
+        if (!reloadSimulation(count, initial)) return false;
+        discardAccumulator(); // only after the new mode is known to work
+        setFramesInFlight(kMaxFramesInFlight);
+        cameraMode_ = wantsCamera;
+        noteLoaded();
         return true;
     }
 
-    // Switching from a simulation shader back to a plain one.
-    if (sim_) {
-        vkDeviceWaitIdle(ctx_.device());
-        sim_->destroy(ctx_);
-        sim_.reset();
+    if (directives.accumulate) {
+        if (!reloadAccumulator(initial)) return false;
+        discardSimulation();
+        setFramesInFlight(1);
+        cameraMode_ = wantsCamera;
+        noteLoaded();
+        return true;
     }
 
+    // Plain one-dispatch-per-pixel path. Note that the modes it might be
+    // replacing are only torn down once this has succeeded, so a bad edit that
+    // deletes a directive leaves the running simulation or accumulation alone
+    // instead of dropping to a blank window.
     const CompileResult result = compileComputeShader(shaderPath_);
     if (!result.ok) {
         std::fprintf(stderr, "[lab] shader compile failed:\n%s\n", result.message.c_str());
@@ -574,9 +675,11 @@ bool App::reloadShader(bool initial) {
     }
     pipeline_ = built;
 
-    std::error_code ec;
-    shaderWriteTime_ = fs::last_write_time(shaderPath_, ec);
-    std::printf("[lab] %s %s\n", initial ? "loaded" : "reloaded", shaderPath_.filename().string().c_str());
+    discardSimulation();
+    discardAccumulator();
+    setFramesInFlight(kMaxFramesInFlight);
+    cameraMode_ = wantsCamera; // //!camera3d without either special mode
+    noteLoaded();
     return true;
 }
 
@@ -638,12 +741,17 @@ bool App::drawFrame() {
     lastFrameTime_ = now;
 
     const VkExtent2D extent = swapchain_.extent();
-    if (sim_) {
+    // Exactly one navigation model runs per frame. Both read the cursor and both
+    // write nav_.lastCursor, so letting both run would double-count a drag.
+    if (cameraMode_) {
         updateCamera(deltaTime);
     } else {
         updateNavigation(deltaTime);
     }
 
+    // One block for every mode. The camera fields are filled unconditionally
+    // rather than per mode: a pixel shader declares only the prefix it uses, so
+    // the extra bytes cost one memcpy into the command buffer and save a branch.
     PushConstants push{};
     push.resolution[0] = static_cast<float>(extent.width);
     push.resolution[1] = static_cast<float>(extent.height);
@@ -655,6 +763,26 @@ bool App::drawFrame() {
     push.time = static_cast<float>(now - startTime_);
     push.deltaTime = deltaTime;
     push.frame = frameCounter_;
+    push.particleCount = sim_ ? sim_->particleCount() : 0;
+
+    constexpr float kFovDegrees = 60.0f;
+    push.fovScale = std::tan(kFovDegrees * 0.5f * 3.14159265f / 180.0f);
+    push.camPos[0] = float(camera_.x);
+    push.camPos[1] = float(camera_.y);
+    push.camPos[2] = float(camera_.z);
+    cameraBasis(push.camRight, push.camUp, push.camForward);
+
+    if (accum_) {
+        // Camera moved => every sample in the buffer was traced through a
+        // different lens, so averaging the next one in would smear the image.
+        // Compared against what the *last sample* used, not against the previous
+        // frame, so a reset that has already happened is not repeated.
+        const AccumView view = accumViewOf(push);
+        if (!(view == lastAccumView_)) {
+            lastAccumView_ = view;
+            accum_->requestReset();
+        }
+    }
 
     VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -669,19 +797,11 @@ bool App::drawFrame() {
                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
     if (sim_) {
-        SimPushConstants simPush{};
-        static_assert(sizeof(simPush) >= sizeof(push), "sim push must extend the standard block");
-        std::memcpy(&simPush, &push, sizeof(push)); // identical leading layout
-        simPush.particleCount = sim_->particleCount();
-
-        constexpr float kFovDegrees = 60.0f;
-        simPush.fovScale = std::tan(kFovDegrees * 0.5f * 3.14159265f / 180.0f);
-        simPush.camPos[0] = float(camera_.x);
-        simPush.camPos[1] = float(camera_.y);
-        simPush.camPos[2] = float(camera_.z);
-        cameraBasis(simPush.camRight, simPush.camUp, simPush.camForward);
-
-        sim_->record(frame.cmd, frameIndex_, simPush);
+        sim_->record(frame.cmd, frameIndex_, push);
+    } else if (accum_) {
+        // The accumulator stamps in the live sample count itself, so nothing here
+        // has to stay in step with a reset it may have just performed.
+        accum_->record(frame.cmd, frameIndex_, push);
     } else {
         vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
@@ -737,17 +857,25 @@ bool App::drawFrame() {
     present.pImageIndices = &imageIndex;
 
     const VkResult presented = vkQueuePresentKHR(ctx_.queue(), &present);
+    bool recreated = false;
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR || framebufferResized_) {
         framebufferResized_ = false;
         recreateSwapchain();
+        recreated = true;
     } else if (presented != VK_SUCCESS) {
         VK_CHECK(presented);
     }
 
-    frameIndex_ = (frameIndex_ + 1) % kFramesInFlight;
+    frameIndex_ = (frameIndex_ + 1) % framesInFlight_;
     ++frameCounter_;
     updateTitle(now);
-    return true;
+
+    // Report "did not render" when the swapchain was just rebuilt. Recreating the
+    // frame targets leaves every one of them in VK_IMAGE_LAYOUT_UNDEFINED, but
+    // captureFrame copies from the last submitted target assuming
+    // TRANSFER_SRC_OPTIMAL — so allowing a capture after a recreate would read an
+    // image in the wrong layout.
+    return !recreated;
 }
 
 // --------------------------------------------------------------- capture ----
@@ -806,8 +934,11 @@ fs::path App::screenshotPath() const {
 }
 
 bool App::captureFrame(const fs::path& path) {
-    // The most recently submitted frame, whose target still holds its pixels.
-    const uint32_t last = (frameIndex_ + kFramesInFlight - 1) % kFramesInFlight;
+    // The most recently submitted frame, whose target still holds its pixels. In
+    // accumulation mode that is slot 0 every time, and its target holds the mean
+    // of every sample taken so far — so --capture --frames N writes the image as
+    // it stood after N samples, not a single noisy one.
+    const uint32_t last = (frameIndex_ + framesInFlight_ - 1) % framesInFlight_;
     Frame& frame = frames_[last];
     VK_CHECK(vkWaitForFences(ctx_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
 
@@ -894,9 +1025,12 @@ void App::recreateSwapchain() {
     createFrameTargets();
     createPresentSemaphores();
 
-    // The simulation's accumulation images track the framebuffer, and its
-    // descriptors point at target views that were just recreated.
+    // The simulation's count images track the framebuffer, and its descriptors
+    // point at target views that were just recreated.
     if (sim_) sim_->resize(ctx_, targetViews(), swapchain_.extent());
+    // Same for the accumulation image, which additionally has to start over: a
+    // sum computed for one pixel grid means nothing on another.
+    if (accum_) accum_->resize(ctx_, targetViews(), swapchain_.extent());
 }
 
 void App::updateTitle(double now) {
@@ -909,6 +1043,13 @@ void App::updateTitle(double now) {
     if (sim_)
         std::snprintf(detail, sizeof(detail), " — %u bodies%s — speed %.3f", sim_->particleCount(),
                       sim_->paused() ? " (paused)" : "", camera_.speed);
+    else if (accum_)
+        // The sample count is the only feedback that says whether the image is
+        // still refining or has been reset by a camera nudge you did not notice.
+        std::snprintf(detail, sizeof(detail), " — %u samples — speed %.3f", accum_->sampleIndex(),
+                      camera_.speed);
+    else if (cameraMode_)
+        std::snprintf(detail, sizeof(detail), " — speed %.3f", camera_.speed);
     char title[320];
     std::snprintf(title, sizeof(title), "vulkan-compute-lab — %s%s — %ux%u — %.0f fps",
                   shaderPath_.filename().string().c_str(), detail, extent.width, extent.height, fps);
@@ -922,6 +1063,10 @@ void App::cleanup() {
     if (sim_) {
         sim_->destroy(ctx_);
         sim_.reset();
+    }
+    if (accum_) {
+        accum_->destroy(ctx_);
+        accum_.reset();
     }
     destroyPipeline();
     destroyPresentSemaphores();

@@ -1,0 +1,511 @@
+#version 450
+
+// Progressive path tracer: one new sample per frame, summed into a persistent
+// float image, displayed as the running mean. It starts as visible noise and
+// resolves over a few hundred frames; every reset (camera move, shader save,
+// resize, Space) starts the average again.
+//
+//!accumulate
+//!alias pt trace raytrace rt
+//
+// `//!accumulate` is what puts the host in accumulation mode: one persistent
+// rgba32f image at binding 1, one dispatch per frame, a single frame in flight,
+// and `sampleIndex` counting the samples already banked. It also implies the 3D
+// fly camera, so drag to look, WASD to fly, Q/E down/up, shift to boost, ctrl to
+// crawl, scroll to trim speed, Home to reset, Space to restart the average.
+//
+// Everything below the tunables block is a brute-force unidirectional trace:
+// analytic spheres and one plane, no acceleration structure, no light sampling.
+// Lights are found by chance, which is why the emitters here are large and dim
+// rather than small and fierce -- see LIGHTS, below.
+//
+// World is z-up to match the camera in src/app.cpp, so the ground plane is z = 0
+// and "up" in the sky gradient is +z.
+//
+// Every constant is a plain `const`: edit, save, and the reload resets the
+// accumulator and re-converges on the new values.
+
+// ---------------------------------------------------------------- tunables --
+
+const int   MAX_BOUNCES   = 8;     // path length cap; 8 is well past diminishing returns
+const int   RR_START      = 3;     // bounces traced before Russian roulette may kill a path
+const float RR_FLOOR      = 0.05;  // minimum survival probability, so RR cannot stall a path to zero
+
+// Ray offset along the normal when continuing a path. Too small and every
+// surface self-intersects at grazing angles, which reads as dark speckle
+// ("shadow acne"); too large and contact shadows lift off, so spheres float.
+// Tuned for this scene's ~1 unit extent in fp32.
+const float RAY_EPS       = 3e-4;
+const float T_MAX         = 1e4;   // treated as "missed everything", i.e. sky
+
+const float EXPOSURE      = 1.0;   // linear scale before the tonemap curve
+
+// A single unlucky path (a near-specular chain that happens to land on the
+// emitter) can return hundreds of units and leave a white dot that averages away
+// only after thousands of samples. Clamping the per-sample radiance kills those
+// fireflies at the cost of quietly discarding real energy -- this IS a bias, and
+// it is the one place in the shader where energy is destroyed on purpose. Raise
+// it toward infinity for a reference render; drop it toward 4 for a fast preview.
+const float FIREFLY_CLAMP = 24.0;
+
+// Sky: a gradient acting as a large area light, so nothing is ever pitch black
+// and the ambient occlusion in the sphere contacts is visible.
+const vec3  SKY_HORIZON   = vec3(0.52, 0.62, 0.78);
+const vec3  SKY_ZENITH    = vec3(0.16, 0.28, 0.55);
+const float SKY_INTENSITY = 0.85;
+
+// A deliberately BROAD sun. A tight disc is the physically interesting choice
+// but with no light sampling it would be found by roughly one path in a
+// thousand, each carrying a thousand times the mean -- pure firefly noise. A
+// wide, dim lobe delivers a similar amount of directional light with variance
+// low enough to converge, and still casts a readable soft shadow.
+const vec3  SUN_DIR       = normalize(vec3(0.30, 0.50, 0.60));
+const vec3  SUN_COLOUR    = vec3(3.0, 2.6, 2.1);
+const float SUN_TIGHTNESS = 64.0;  // cosine exponent; higher = smaller, harsher sun
+
+// Ground plane. The checker is not decoration: high-frequency detail at grazing
+// angles is where sub-pixel jitter earns its keep, so it makes the antialiasing
+// converge in front of you instead of having to be taken on trust.
+const float GROUND_Z      = 0.0;
+const float CHECKER_SCALE = 4.0;   // squares per world unit
+const vec3  CHECKER_A     = vec3(0.58, 0.58, 0.60);
+const vec3  CHECKER_B     = vec3(0.30, 0.30, 0.33);
+
+const float PI  = 3.14159265359;
+const float TAU = 6.28318530718;
+
+// ------------------------------------------------------------------- scene --
+
+// Material kinds. Kept as an int switch rather than a general BSDF because each
+// kind has its own sampling strategy and its own pdf cancellation, and mixing
+// them behind one interface hides exactly the bookkeeping this file is meant to
+// show.
+const int KIND_DIFFUSE = 0;  // Lambertian
+const int KIND_METAL   = 1;  // perturbed mirror, roughness 0 = perfect
+const int KIND_LIGHT   = 2;  // pure emitter, absorbs anything that hits it
+
+struct Material {
+    vec3  albedo;     // reflectance; must stay <= 1 per channel or the scene generates energy
+    vec3  emission;   // radiance leaving the surface, in the same units as the sky
+    float roughness;  // KIND_METAL only: lobe width of the perturbed reflection
+    int   kind;
+};
+
+struct Sphere {
+    vec3     centre;
+    float    radius;
+    Material mat;
+};
+
+// Six spheres sitting on z = 0, sized and placed for the default camera in
+// src/app.cpp (position (0, -0.95, 0.42) looking along +y and slightly down).
+// Move the camera far from here and the framing stops being deliberate, which is
+// fine -- it is a fly camera.
+const int SPHERE_COUNT = 6;
+const Sphere SPHERES[SPHERE_COUNT] = Sphere[SPHERE_COUNT](
+    // Large diffuse, warm: the reference surface for judging bounce light.
+    Sphere(vec3(-0.34,  0.06, 0.16), 0.16,
+           Material(vec3(0.72, 0.36, 0.28), vec3(0.0), 0.0,  KIND_DIFFUSE)),
+
+    // Near-mirror metal. Reflects the sky, the emitter and its neighbours, so it
+    // is where any error in the throughput bookkeeping shows up first.
+    Sphere(vec3( 0.00,  0.14, 0.20), 0.20,
+           Material(vec3(0.95, 0.96, 0.97), vec3(0.0), 0.02, KIND_METAL)),
+
+    // Rough copper. Same code path as the mirror, wider lobe.
+    Sphere(vec3( 0.33, -0.06, 0.12), 0.12,
+           Material(vec3(0.95, 0.64, 0.44), vec3(0.0), 0.30, KIND_METAL)),
+
+    // Small cool diffuse, close to the camera and to the ground: the tightest
+    // contact shadow in the scene.
+    Sphere(vec3(-0.10, -0.26, 0.07), 0.07,
+           Material(vec3(0.26, 0.42, 0.68), vec3(0.0), 0.0,  KIND_DIFFUSE)),
+
+    // The main light: an emissive sphere, i.e. a spherical area light. Big and
+    // only moderately bright on purpose -- with lights found by chance, the
+    // noise level is set by how much solid angle the emitter covers. This one
+    // subtends roughly a quarter steradian from the scene centre, so about one
+    // diffuse bounce in twenty finds it directly.
+    Sphere(vec3(-0.05,  0.44, 0.52), 0.11,
+           Material(vec3(0.0), vec3(14.0, 11.5, 8.5), 0.0,  KIND_LIGHT)),
+
+    // A dim cyan accent light, low and behind the metals, to put some colour
+    // into the shadow side. Small, so keep it dim: its contribution per hit is
+    // what fireflies are made of.
+    Sphere(vec3( 0.42,  0.30, 0.05), 0.05,
+           Material(vec3(0.0), vec3(2.0, 4.5, 6.0), 0.0,  KIND_LIGHT))
+);
+
+// ------------------------------------------------------------------ layout --
+
+// One invocation per pixel. 16x16 = 256 threads per workgroup, which maps
+// cleanly onto both AMD wave64 and NVIDIA warp32 scheduling.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// `rgba8` must match the VK_FORMAT_R8G8B8A8_UNORM target created on the host.
+// It is UNORM, not SRGB, and the host blits it straight to a UNORM swapchain --
+// nothing in the pipeline applies a transfer function, so this shader has to
+// encode gamma itself (see main).
+layout(binding = 0, rgba8) uniform writeonly image2D target;
+
+// The running sum of radiance, in linear units, at framebuffer size. Read AND
+// write: the whole of accumulation mode is load, add one sample, store. The host
+// guarantees a single frame in flight for this reason -- two submissions
+// read-modify-writing this image would race, and no barrier inside one command
+// buffer can order work across submissions.
+layout(binding = 1, rgba32f) uniform image2D accumImage;
+
+// A prefix of the unified push block in src/app.hpp. Declaring only part of it
+// is legal as long as the offsets of what IS declared match exactly, which they
+// do up to and including sampleIndex at offset 112.
+layout(push_constant) uniform Push {
+    vec2  resolution;     //   0
+    vec2  mouse;          //   8  normalised 0..1, y down
+    vec2  center;         //  16  2D pan target, unused here
+    float zoom;           //  24  unused here
+    float time;           //  28
+    float deltaTime;      //  32
+    uint  frame;          //  36
+    uint  particleCount;  //  40  always 0 in this mode
+    float fovScale;       //  44  tan(fov / 2)
+    vec4  camPos;         //  48
+    vec4  camRight;       //  64
+    vec4  camUp;          //  80
+    vec4  camForward;     //  96
+    uint  sampleIndex;    // 112  samples ALREADY in accumImage
+} pc;
+
+// --------------------------------------------------------------------- rng --
+
+// One hash-based stream per invocation. The seed has to decorrelate along both
+// axes at once: across pixels within a frame (or neighbours share paths and the
+// image shows structured blotches) and across samples at one pixel (or every
+// frame adds the same sample and the noise never averages away -- it just gets
+// brighter). A weak mixer fails the second case in a way that is easy to miss
+// for the first few seconds and then obvious as permanent banding.
+//
+// PCG's output permutation, which has full avalanche: flipping one input bit
+// changes about half the output bits. Notably NOT fract(sin(dot(...))), whose
+// precision collapses at large arguments and whose zeros lie on lines in the
+// plane -- visible as diagonal streaks across the image.
+uint pcgHash(uint x) {
+    x = x * 747796405u + 2891336453u;
+    uint word = ((x >> ((x >> 28) + 4u)) ^ x) * 277803737u;
+    return (word >> 22) ^ word;
+}
+
+uint rngState;
+
+void seedRng(uvec2 pixel, uint sampleIndex) {
+    // Mix the coordinates with large odd constants first so nearby pixels are
+    // far apart in key space, then run two hash rounds. One round of a good
+    // mixer is enough in theory; the second costs a couple of instructions in a
+    // shader that traces eight bounces, and removes any doubt.
+    // Hash sequentially rather than XOR-ing three products together. An XOR of
+    // products is not injective: distinct (x, y) pairs can collide, and because
+    // the sampleIndex term XORs in a value common to every pixel, a collision
+    // survives every frame identically. Two pixels sharing a stream forever means
+    // correlated noise that averaging can never remove -- measured at 144 pixels
+    // permanently aliased on a 1280x720 grid with the XOR form.
+    uint key = pcgHash(pixel.x);
+    key = pcgHash(key + pixel.y);
+    rngState = pcgHash(key + sampleIndex);
+}
+
+// Uniform in [0, 1). The 24-bit shift keeps every value exactly representable in
+// fp32, so the distribution stays uniform instead of quantising unevenly near 1.
+float rand() {
+    rngState = pcgHash(rngState);
+    return float(rngState >> 8) * (1.0 / 16777216.0);
+}
+
+vec2 rand2() { return vec2(rand(), rand()); }
+
+// Branchless orthonormal basis (Duff et al. 2017). The obvious construction --
+// cross the normal with some fixed axis -- degenerates when the normal is
+// parallel to that axis, and on a sphere that is guaranteed to happen at two
+// pixels. Those pixels then produce garbage directions that never average away.
+void basisFrom(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float d = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * d, -s * n.x);
+    b = vec3(d, s + n.y * n.y * a, -n.y);
+}
+
+// Cosine-weighted direction on the hemisphere around n, by Malley's method: a
+// uniform point on the unit disc lifted vertically onto the hemisphere has
+// density exactly cos(theta)/pi. Sampling that way, rather than sampling
+// uniformly and weighting, is what makes the diffuse throughput update a single
+// multiply -- see the KIND_DIFFUSE branch.
+vec3 sampleCosineHemisphere(vec3 n) {
+    vec2 u = rand2();
+    float r = sqrt(u.x);                       // sqrt for uniform AREA on the disc
+    float phi = TAU * u.y;
+    // z = sqrt(1 - r^2), maxed against 0 because rounding can push it just under.
+    float z = sqrt(max(0.0, 1.0 - u.x));
+
+    vec3 t, b;
+    basisFrom(n, t, b);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * z);
+}
+
+// Uniform point in the unit ball, used to fuzz the metal reflection lobe.
+// Rejection sampling: a handful of iterations on average, and unlike the
+// normalise-a-gaussian alternative it needs no transcendentals.
+vec3 randomInUnitBall() {
+    // The unit ball fills 52% of the cube, so eight tries fail with probability
+    // ~1e-3 -- and the bounded loop matters: an unbounded `while` here can hang
+    // a whole warp on the one lane still rejecting.
+    for (int i = 0; i < 8; ++i) {
+        vec3 p = vec3(rand(), rand(), rand()) * 2.0 - 1.0;
+        if (dot(p, p) <= 1.0) return p;
+    }
+    return vec3(0.0); // gave up: leaves the reflection unperturbed, which is harmless
+}
+
+// ---------------------------------------------------------------- geometry --
+
+struct Hit {
+    float    t;
+    vec3     position;
+    vec3     normal;   // always faces the incoming ray
+    Material mat;
+};
+
+// Ray-sphere in the "half-b" form: with b = dot(oc, rd) and rd normalised, the
+// quadratic loses the 2s and, more importantly, -b - sqrt(h) is evaluated
+// without the catastrophic cancellation the textbook (-b +/- sqrt(b^2-4ac))/2a
+// suffers when the ray starts far from a small sphere.
+bool hitSphere(vec3 ro, vec3 rd, vec3 centre, float radius, float tMin, float tMax, out float t) {
+    vec3  oc = ro - centre;
+    float b  = dot(oc, rd);
+    float c  = dot(oc, oc) - radius * radius;
+    float h  = b * b - c;
+    if (h < 0.0) return false;
+
+    h = sqrt(h);
+    t = -b - h;                       // near root first
+    if (t < tMin) t = -b + h;         // inside the sphere, or the near root is behind us
+    return t >= tMin && t <= tMax;
+}
+
+// Infinite plane at z = GROUND_Z. Every downward ray hits it, so the sky is only
+// ever seen looking up -- that is what closes the scene and makes the sky
+// gradient act as a hemisphere light rather than a full sphere.
+bool hitGround(vec3 ro, vec3 rd, float tMin, float tMax, out float t) {
+    if (abs(rd.z) < 1e-8) return false;   // parallel: no intersection worth having
+    t = (GROUND_Z - ro.z) / rd.z;
+    return t >= tMin && t <= tMax;
+}
+
+Material groundMaterial(vec3 p) {
+    // Sum of floors, not a product of signs: the parity test stays correct
+    // across the origin, where sign-based checkers develop a doubled square.
+    float parity = mod(floor(p.x * CHECKER_SCALE) + floor(p.y * CHECKER_SCALE), 2.0);
+    vec3 albedo = parity < 0.5 ? CHECKER_A : CHECKER_B;
+    return Material(albedo, vec3(0.0), 0.0, KIND_DIFFUSE);
+}
+
+bool intersectScene(vec3 ro, vec3 rd, out Hit hit) {
+    float closest = T_MAX;
+    bool  found = false;
+    int   which = -1;   // -1 = the ground plane
+
+    float t;
+    if (hitGround(ro, rd, RAY_EPS, closest, t)) {
+        closest = t;
+        found = true;
+    }
+
+    for (int i = 0; i < SPHERE_COUNT; ++i) {
+        if (hitSphere(ro, rd, SPHERES[i].centre, SPHERES[i].radius, RAY_EPS, closest, t)) {
+            closest = t;
+            found = true;
+            which = i;
+        }
+    }
+
+    if (!found) return false;
+
+    hit.t = closest;
+    hit.position = ro + rd * closest;
+
+    vec3 n;
+    if (which < 0) {
+        n = vec3(0.0, 0.0, 1.0);
+        hit.mat = groundMaterial(hit.position);
+    } else {
+        n = (hit.position - SPHERES[which].centre) / SPHERES[which].radius;
+        hit.mat = SPHERES[which].mat;
+    }
+
+    // Flip toward the ray. Only matters for a path that starts inside a sphere
+    // (fly the camera into one), but without it those pixels shade with an
+    // inverted normal and go black.
+    hit.normal = dot(n, rd) < 0.0 ? n : -n;
+    return true;
+}
+
+// ------------------------------------------------------------------ shading --
+
+vec3 skyRadiance(vec3 rd) {
+    // Gradient in z because the world is z-up. Only the upper hemisphere is ever
+    // reached, but clamping keeps this well defined for a camera below ground.
+    float h = clamp(rd.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 sky = mix(SKY_HORIZON, SKY_ZENITH, h * h) * SKY_INTENSITY;
+    sky += SUN_COLOUR * pow(max(dot(rd, SUN_DIR), 0.0), SUN_TIGHTNESS);
+    return sky;
+}
+
+// One path, traced to termination. `throughput` is the product of (BSDF * cos /
+// pdf) over every bounce so far, i.e. the fraction of radiance found ahead that
+// reaches the camera. It must never grow above 1 in any channel through a
+// reflection, or the scene manufactures energy and the image brightens without
+// bound as it converges.
+vec3 tracePath(vec3 ro, vec3 rd) {
+    vec3 radiance   = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (int bounce = 0; bounce < MAX_BOUNCES; ++bounce) {
+        Hit hit;
+        if (!intersectScene(ro, rd, hit)) {
+            radiance += throughput * skyRadiance(rd);
+            break;
+        }
+
+        // Emission is added along the current throughput and does not depend on
+        // sampling the next direction, so it is correct for both lights we hit
+        // by chance and lights we look at directly.
+        radiance += throughput * hit.mat.emission;
+
+        if (hit.mat.kind == KIND_LIGHT) break;   // pure emitters absorb
+
+        vec3 nextDir;
+        if (hit.mat.kind == KIND_DIFFUSE) {
+            nextDir = sampleCosineHemisphere(hit.normal);
+
+            // The bookkeeping, spelled out, because this is the one line where
+            // getting it wrong is invisible until you compare against a
+            // reference:
+            //
+            //   BSDF  f = albedo / pi          (Lambertian, energy-conserving)
+            //   pdf     = cos(theta) / pi      (cosine-weighted, from Malley)
+            //   weight  = f * cos(theta) / pdf = albedo
+            //
+            // The cosines cancel and so do the pis, so the entire update is one
+            // multiply by albedo. Two failure modes to avoid: sampling
+            // uniformly (pdf = 1/2pi) while using this same weight overstates
+            // grazing light by up to 2x, and cosine-sampling while ALSO
+            // multiplying by cos(theta) double-counts the foreshortening and
+            // darkens everything, worst at glancing angles.
+            throughput *= hit.mat.albedo;
+        } else {
+            // Metal: a perturbed mirror. Sampling the lobe and weighting by the
+            // tint only is not a normalised microfacet BSDF -- it is a
+            // roughened specular whose sampling density IS its distribution, so
+            // the ratio is 1 and the tint is the whole weight. That keeps it
+            // strictly energy-losing (albedo <= 1), which is the property worth
+            // protecting; the price is that grazing highlights are not as
+            // bright as a Fresnel-weighted GGX would make them.
+            vec3 reflected = reflect(rd, hit.normal);
+            nextDir = normalize(reflected + hit.mat.roughness * randomInUnitBall());
+
+            // Roughness can scatter the direction below the surface. Absorbing
+            // those paths is the honest cheap fix -- mirroring them back up
+            // would brighten rough metal above its albedo.
+            if (dot(nextDir, hit.normal) <= 0.0) break;
+
+            throughput *= hit.mat.albedo;
+        }
+
+        // Russian roulette. Kill paths in proportion to how little they can
+        // still contribute, and scale the survivors up by 1 / p so the estimator
+        // stays unbiased: the surviving paths carry exactly the energy the
+        // killed ones would have. Started only after RR_START bounces because
+        // early paths carry most of the image and killing them just adds noise.
+        if (bounce >= RR_START) {
+            float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), RR_FLOOR, 1.0);
+            if (rand() > p) break;
+            throughput /= p;
+        }
+
+        // Step off the surface along the normal, not along the new direction: at
+        // grazing angles the new direction barely leaves the surface and the
+        // next intersection finds the same primitive again.
+        ro = hit.position + hit.normal * RAY_EPS;
+        rd = nextDir;
+    }
+
+    return radiance;
+}
+
+// ACES filmic approximation (Narkowicz). Highlights roll off instead of clipping
+// to flat white, which matters here because an emitter in frame is many times
+// brighter than the diffuse scene.
+vec3 tonemap(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Linear -> sRGB, the real piecewise curve. Required because the target is UNORM
+// and the host blits it to a UNORM swapchain: nothing else in the pipeline
+// applies a transfer function, so skipping this leaves the render looking
+// crushed and far too dark in the midtones.
+vec3 encodeSrgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(max(c, vec3(1e-5)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, lessThanEqual(c, vec3(0.0031308)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = ivec2(pc.resolution);
+
+    // The dispatch is rounded up to whole workgroups, so the last row and
+    // column of invocations can fall outside the image.
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    seedRng(uvec2(pixel), pc.sampleIndex);
+
+    // Sub-pixel jitter: a uniform sample inside the pixel footprint, which is a
+    // box reconstruction filter. This is what antialiases the image as it
+    // converges -- without it every sample runs through the pixel centre and the
+    // edges stay hard-aliased no matter how long it accumulates.
+    vec2 jittered = vec2(pixel) + rand2();
+
+    // Camera ray, in half-screen-HEIGHT units so the horizontal field of view
+    // widens with the aspect ratio rather than the image squashing at 16:9 --
+    // same convention as the projection in shaders/galaxy.comp, inverted. The y
+    // negation is the image-space (y down) to camera-space (camUp) flip.
+    vec2 uv = (jittered - 0.5 * pc.resolution) / (0.5 * pc.resolution.y);
+    vec3 rd = normalize(pc.camForward.xyz
+                        + pc.camRight.xyz * (uv.x * pc.fovScale)
+                        - pc.camUp.xyz    * (uv.y * pc.fovScale));
+
+    vec3 sample_ = tracePath(pc.camPos.xyz, rd) * EXPOSURE;
+    // Reject non-finite samples BEFORE clamping, not after. GLSL leaves min()
+    // undefined when an operand is NaN, and both NVIDIA and AMD follow IEEE
+    // minNum by returning the non-NaN operand -- so min(NaN, 24.0) yields 24.0,
+    // and a NaN would be laundered into a bright sample and banked permanently
+    // into the accumulator instead of being discarded.
+    if (any(isnan(sample_)) || any(isinf(sample_))) sample_ = vec3(0.0);
+
+    sample_ = min(sample_, vec3(FIREFLY_CLAMP));
+
+    // (The non-finite check that used to live here now runs before the clamp
+    // above, since min() would otherwise launder a NaN into FIREFLY_CLAMP.)
+
+    // sampleIndex == 0 means the host has just cleared the image, so ignoring
+    // the loaded value costs nothing and makes a missed clear show up as one bad
+    // frame instead of a stain that survives every subsequent reset.
+    vec3 previous = pc.sampleIndex == 0u ? vec3(0.0) : imageLoad(accumImage, pixel).rgb;
+    vec3 sum = previous + sample_;
+    imageStore(accumImage, pixel, vec4(sum, 1.0));
+
+    // sampleIndex counts what was ALREADY banked, and we have just added one, so
+    // the divisor is sampleIndex + 1 -- never zero, so no guard is needed.
+    vec3 mean = sum / float(pc.sampleIndex + 1u);
+
+    imageStore(target, pixel, vec4(encodeSrgb(tonemap(mean)), 1.0));
+}
